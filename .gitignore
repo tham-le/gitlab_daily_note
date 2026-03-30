@@ -1,0 +1,4 @@
+.daily-note.json
+.daily-note-cache/
+.daily-note-state.json
+__pycache__/
