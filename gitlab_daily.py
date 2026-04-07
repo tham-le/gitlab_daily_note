@@ -1503,7 +1503,9 @@ class GitLabSync:
 
         with open(filepath, "w") as f:
             f.write(final_content)
-        print(f"Done: {filepath}", file=sys.stderr)
+        abs_path = filepath.resolve()
+        link = f"\033]8;;file://{abs_path}\033\\{filepath}\033]8;;\033\\"
+        print(f"Done: {link}", file=sys.stderr)
 
         if keep:
             snapshot_path = self.get_snapshot_path(date)

@@ -287,7 +287,9 @@ def main():
         filepath = base_dir / f"{year}-{month:02d}-resume.md"
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content)
-        print(f"Saved to {filepath}", file=sys.stderr)
+        abs_path = filepath.resolve()
+        link = f"\033]8;;file://{abs_path}\033\\{filepath}\033]8;;\033\\"
+        print(f"✓ Saved to {link}", file=sys.stderr)
 
 
 if __name__ == "__main__":
