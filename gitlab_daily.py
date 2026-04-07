@@ -1504,7 +1504,7 @@ class GitLabSync:
         with open(filepath, "w") as f:
             f.write(final_content)
         abs_path = filepath.resolve()
-        link = f"\033]8;;file://{abs_path}\033\\{filepath}\033]8;;\033\\"
+        link = f"\033]8;;file://{abs_path}\a{filepath}\033]8;;\a"
         print(f"Done: {link}", file=sys.stderr)
 
         if keep:

@@ -288,7 +288,7 @@ def main():
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content)
         abs_path = filepath.resolve()
-        link = f"\033]8;;file://{abs_path}\033\\{filepath}\033]8;;\033\\"
+        link = f"\033]8;;file://{abs_path}\a{filepath}\033]8;;\a"
         print(f"✓ Saved to {link}", file=sys.stderr)
 
 
