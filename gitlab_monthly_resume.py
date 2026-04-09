@@ -284,7 +284,9 @@ def main():
     else:
         config = load_config()
         base_dir = Path(config.get("base_dir", "monthly-resume"))
-        filepath = base_dir / f"{year}-{month:02d}-resume.md"
+        import calendar
+        month_abbr = calendar.month_abbr[month]
+        filepath = base_dir / f"{year}" / f"{month:02d}-{month_abbr}" / f"{year}-{month:02d}-resume.md"
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content)
         abs_path = filepath.resolve()
