@@ -1179,6 +1179,64 @@ class GitLabSync:
         print(f"Found {len(self.team_mrs)} team MRs to review", file=sys.stderr)
         self.cache.set("team", self.team_mrs)
 
+    def fetch_team_discussions(self):
+        """Fetch discussions on team MRs where I participated (user_notes_count > 0)."""
+        participated = [
+            mr for mr in self.team_mrs
+            if mr.get("user_notes_count", 0) > 0
+        ]
+        if not participated:
+            return
+
+        print(f"Fetching discussions for {len(participated)} team MRs I commented on...", file=sys.stderr)
+        for mr in participated:
+            project_id = mr["project_id"]
+            iid = mr["iid"]
+            output = self.run_command(
+                ["glab", "api", f"projects/{project_id}/merge_requests/{iid}/discussions?per_page=100"]
+            )
+            if not output:
+                continue
+
+            discussions = json.loads(output)
+            if not isinstance(discussions, list):
+                continue
+
+            to_close = 0
+            for disc in discussions:
+                notes = disc.get("notes", [])
+                if not notes:
+                    continue
+                if notes[0].get("system", False):
+                    continue
+                if not notes[0].get("resolvable", False):
+                    continue
+                if all(n.get("resolved", False) for n in notes if n.get("resolvable")):
+                    continue
+
+                first_author = notes[0].get("author", {}).get("username", "")
+                last_author = notes[-1].get("author", {}).get("username", "")
+
+                # Only care about threads I opened where someone replied
+                if first_author == self.username and last_author != self.username:
+                    to_close += 1
+
+            if to_close > 0:
+                self.mr_discussions[mr["web_url"]] = {
+                    "pending": 0,
+                    "answered": 0,
+                    "to_close": to_close,
+                    "resolved": 0,
+                    "pending_authors": set(),
+                }
+
+        team_discussed = sum(
+            1 for mr in self.team_mrs
+            if mr["web_url"] in self.mr_discussions
+        )
+        if team_discussed:
+            print(f"  {team_discussed} team MRs with threads to close", file=sys.stderr)
+
     # -- Helpers --
 
     def _is_on_hold(self, item):
@@ -1294,12 +1352,15 @@ class GitLabSync:
             else:
                 waiting.append(mr)
 
-        # Threads to close
+        # Threads to close (own MRs + team MRs I commented on)
         close_mrs = [
             mr for mr in self.mrs
             if mr["web_url"] in active_mr_urls
             and self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0
         ]
+        for mr in self.team_mrs:
+            if self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0:
+                close_mrs.append(mr)
 
         # To Do: issues with no open MR (work not started yet)
         filtered_issues = self.filter_relevant_issues()
@@ -1473,6 +1534,7 @@ class GitLabSync:
         if self.include_team:
             print("\nFetching team MRs to review...", file=sys.stderr)
             self.fetch_team_mrs()
+            self.fetch_team_discussions()
 
         print("\nCategorizing todos...", file=sys.stderr)
         todo_categories = self.categorize_todos()
