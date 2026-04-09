@@ -1141,9 +1141,20 @@ class GitLabSync:
             "issue_all_mrs": cache_issue_all_mrs,
         })
 
-    def fetch_team_mrs(self):
+    def _fetch_all_group_mrs(self):
+        """Fetch all open MRs from configured groups (cached, shared by team + discussions)."""
+        if hasattr(self, "_all_group_mrs"):
+            return self._all_group_mrs
+
+        cached = self.cache.get("all_group_mrs")
+        if cached:
+            print("Using cached group MRs...", file=sys.stderr)
+            self._all_group_mrs = cached
+            return cached
+
         if not self.username:
-            return
+            self._all_group_mrs = []
+            return []
 
         groups = self.config.get("gitlab_groups", [])
         if not groups:
@@ -1151,14 +1162,8 @@ class GitLabSync:
             if single:
                 groups = [single]
         if not groups:
-            print("No gitlab_group(s) configured, skipping team MRs", file=sys.stderr)
-            return
-
-        cached = self.cache.get("team")
-        if cached:
-            print("Using cached team MRs...", file=sys.stderr)
-            self.team_mrs = cached
-            return
+            self._all_group_mrs = []
+            return []
 
         all_mrs = []
         for group in groups:
@@ -1170,19 +1175,33 @@ class GitLabSync:
             if output:
                 all_mrs.extend(json.loads(output))
 
-        self.team_mrs = [
+        # Exclude own MRs
+        other_mrs = [
             mr for mr in all_mrs
             if mr.get("author", {}).get("id") != self.user_id
-            and not mr.get("draft", False)
+        ]
+        self._all_group_mrs = other_mrs
+        self.cache.set("all_group_mrs", other_mrs)
+        return other_mrs
+
+    def fetch_team_mrs(self):
+        """Filter group MRs to non-draft for the review list (--team only)."""
+        all_group = self._fetch_all_group_mrs()
+        self.team_mrs = [
+            mr for mr in all_group
+            if not mr.get("draft", False)
             and not mr.get("work_in_progress", False)
         ]
         print(f"Found {len(self.team_mrs)} team MRs to review", file=sys.stderr)
-        self.cache.set("team", self.team_mrs)
 
     def fetch_team_discussions(self):
-        """Fetch discussions on team MRs where I participated (user_notes_count > 0)."""
+        """Fetch discussions on group MRs where I participated (always runs)."""
+        all_group = self._fetch_all_group_mrs()
+        if not all_group:
+            return
+
         participated = [
-            mr for mr in self.team_mrs
+            mr for mr in all_group
             if mr.get("user_notes_count", 0) > 0
         ]
         if not participated:
@@ -1231,7 +1250,7 @@ class GitLabSync:
                 }
 
         team_discussed = sum(
-            1 for mr in self.team_mrs
+            1 for mr in all_group
             if mr["web_url"] in self.mr_discussions
         )
         if team_discussed:
@@ -1358,7 +1377,7 @@ class GitLabSync:
             if mr["web_url"] in active_mr_urls
             and self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0
         ]
-        for mr in self.team_mrs:
+        for mr in getattr(self, "_all_group_mrs", []):
             if self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0:
                 close_mrs.append(mr)
 
@@ -1531,10 +1550,12 @@ class GitLabSync:
         self.fetch_issues()
         self.build_issue_mr_links()
 
+        print("\nChecking threads on group MRs...", file=sys.stderr)
+        self.fetch_team_discussions()
+
         if self.include_team:
             print("\nFetching team MRs to review...", file=sys.stderr)
             self.fetch_team_mrs()
-            self.fetch_team_discussions()
 
         print("\nCategorizing todos...", file=sys.stderr)
         todo_categories = self.categorize_todos()
