@@ -79,7 +79,7 @@ LIMIT 7
 | **Approved** | Approved MRs ready to merge (sorted by most approvals) |
 | **Issues** | All issues with their linked MRs (reference section) |
 | **On Hold** | MRs/issues matching `on_hold_patterns` |
-| **To Review** | Team MRs needing your review (`--team` flag) |
+| **To Review** | Team MRs needing your review (`--team` flag), grouped by milestone and author. Drafts in a separate section. |
 | **Recently Merged** | MRs merged in the last 3 days |
 | **Changes Since Yesterday** | New/merged/closed MRs and issues since last run |
 
