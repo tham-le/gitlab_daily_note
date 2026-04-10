@@ -582,27 +582,66 @@ class PlainFormatter:
             lines.append(self._format_issue_line(issue))
         lines.append("")
 
+    def _render_team_mr_line(self, sync, mr, show_author=True):
+        author = mr.get("author", {}).get("username", "?")
+        changes = mr.get("changes_count", "")
+        size = f" | {changes} changes" if changes else ""
+        title = mr["title"]
+        if mr.get("draft") and not title.startswith("Draft:"):
+            title = f"Draft: {title}"
+        by = f" — by @{author}" if show_author else ""
+        line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {title}{by}{size}"
+        days = sync._get_staleness(mr)
+        if days >= 3:
+            line += f" | idle {days}d"
+        return line
+
+    def _group_by_milestone(self, team_mrs):
+        groups = defaultdict(list)
+        for mr in team_mrs:
+            ms = mr.get("milestone")
+            ms_title = ms["title"] if ms else "No milestone"
+            groups[ms_title].append(mr)
+        def sort_key(title):
+            if title == "No milestone":
+                return (2, "")
+            for mr in team_mrs:
+                ms = mr.get("milestone")
+                if ms and ms["title"] == title and ms.get("due_date"):
+                    return (0, ms["due_date"])
+            return (1, title)
+        return sorted(groups.items(), key=lambda x: sort_key(x[0]))
+
     def _render_team(self, sync, lines):
         if not sync.team_mrs:
             return
         lines.append("---")
         lines.append("")
         lines.append("## To Review")
-        repo_groups = defaultdict(list)
-        for mr in sync.team_mrs:
-            repo = sync._get_repo_short_name(mr)
-            repo_groups[repo].append(mr)
-        for repo in sorted(repo_groups.keys()):
-            if len(repo_groups) > 1:
-                lines.append(f"*{repo}:*")
-            for mr in repo_groups[repo]:
+
+        # Separate ready vs draft
+        ready = [mr for mr in sync.team_mrs if not mr.get("draft")]
+        drafts = [mr for mr in sync.team_mrs if mr.get("draft")]
+
+        for ms_title, mrs in self._group_by_milestone(ready):
+            lines.append(f"### {ms_title}")
+            # Group by author within milestone
+            author_groups = defaultdict(list)
+            for mr in mrs:
                 author = mr.get("author", {}).get("username", "?")
-                line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']} — by @{author}"
-                days = sync._get_staleness(mr)
-                if days >= 3:
-                    line += f" | idle {days}d"
-                lines.append(line)
-        lines.append("")
+                author_groups[author].append(mr)
+            for author in sorted(author_groups.keys()):
+                author_mrs = author_groups[author]
+                lines.append(f"**@{author}** ({len(author_mrs)})")
+                for mr in author_mrs:
+                    lines.append(self._render_team_mr_line(sync, mr, show_author=False))
+            lines.append("")
+
+        if drafts:
+            lines.append(f"### Drafts ({len(drafts)})")
+            for mr in drafts:
+                lines.append(self._render_team_mr_line(sync, mr))
+            lines.append("")
 
     def _render_changelog(self, sync, lines, diff):
         if sync.recently_merged:
@@ -802,22 +841,28 @@ class ObsidianFormatter(PlainFormatter):
         if sync.team_mrs:
             lines.append("---")
             lines.append("")
-            cl = []
-            repo_groups = defaultdict(list)
-            for mr in sync.team_mrs:
-                repo = sync._get_repo_short_name(mr)
-                repo_groups[repo].append(mr)
-            for repo in sorted(repo_groups.keys()):
-                if len(repo_groups) > 1:
-                    cl.append(f"*{repo}:*")
-                for mr in repo_groups[repo]:
-                    author = mr.get("author", {}).get("username", "?")
-                    line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']} — by @{author}"
-                    days = sync._get_staleness(mr)
-                    if days >= 3:
-                        line += f" | idle {days}d"
-                    cl.append(line)
-            lines.extend(self._callout("info", "To Review", cl))
+            ready = [mr for mr in sync.team_mrs if not mr.get("draft")]
+            drafts = [mr for mr in sync.team_mrs if mr.get("draft")]
+
+            if ready:
+                for ms_title, mrs in self._group_by_milestone(ready):
+                    cl = []
+                    author_groups = defaultdict(list)
+                    for mr in mrs:
+                        author = mr.get("author", {}).get("username", "?")
+                        author_groups[author].append(mr)
+                    for author in sorted(author_groups.keys()):
+                        author_mrs = author_groups[author]
+                        cl.append(f"**@{author}** ({len(author_mrs)})")
+                        for mr in author_mrs:
+                            cl.append(self._render_team_mr_line(sync, mr, show_author=False))
+                    lines.extend(self._callout("info", f"To Review — {ms_title}", cl))
+
+            if drafts:
+                cl = []
+                for mr in drafts:
+                    cl.append(self._render_team_mr_line(sync, mr))
+                lines.extend(self._callout("abstract", f"Drafts ({len(drafts)})", cl))
 
         self._render_changelog(sync, lines, diff)
 
@@ -1185,13 +1230,9 @@ class GitLabSync:
         return other_mrs
 
     def fetch_team_mrs(self):
-        """Filter group MRs to non-draft for the review list (--team only)."""
+        """Fetch team MRs for the review list (--team only). Includes drafts."""
         all_group = self._fetch_all_group_mrs()
-        self.team_mrs = [
-            mr for mr in all_group
-            if not mr.get("draft", False)
-            and not mr.get("work_in_progress", False)
-        ]
+        self.team_mrs = list(all_group)
         print(f"Found {len(self.team_mrs)} team MRs to review", file=sys.stderr)
 
     def fetch_team_discussions(self):
