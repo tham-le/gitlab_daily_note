@@ -383,6 +383,8 @@ class PlainFormatter:
                 annotations.append(f"{disc['pending']} pending ({authors})")
             if disc.get("to_close", 0) > 0:
                 annotations.append(f"{disc['to_close']} to close")
+            if disc.get("comments", 0) > 0:
+                annotations.append(f"{disc['comments']} comment(s)")
             if disc["answered"] > 0:
                 annotations.append(f"{disc['answered']} answered")
 
@@ -441,7 +443,8 @@ class PlainFormatter:
         if cats["act_now"] or todos.get("build_failed") or cats["conflict_mrs"]:
             lines.append("## Act Now")
             for mr in cats["act_now"]:
-                if sync.mr_discussions.get(mr["web_url"], {}).get("pending", 0) > 0:
+                disc = sync.mr_discussions.get(mr["web_url"], {})
+                if disc.get("pending", 0) > 0 or disc.get("comments", 0) > 0:
                     lines.append(self.format_mr_line(sync, mr))
             if todos.get("build_failed"):
                 for todo in todos["build_failed"]:
@@ -767,7 +770,8 @@ class ObsidianFormatter(PlainFormatter):
         if cats["act_now"] or todos.get("build_failed") or cats["conflict_mrs"]:
             cl = []
             for mr in cats["act_now"]:
-                if sync.mr_discussions.get(mr["web_url"], {}).get("pending", 0) > 0:
+                disc = sync.mr_discussions.get(mr["web_url"], {})
+                if disc.get("pending", 0) > 0 or disc.get("comments", 0) > 0:
                     cl.append(self.format_mr_line(sync, mr))
             if todos.get("build_failed"):
                 for todo in todos["build_failed"]:
@@ -1032,19 +1036,25 @@ class GitLabSync:
             if not raw_discussions:
                 continue
 
-            pending = answered = to_close = resolved = 0
+            pending = answered = to_close = resolved = comments = 0
             pending_authors = set()
 
             for disc in raw_discussions:
-                if not disc.get("resolvable", False):
-                    continue
-                if disc.get("resolved", False):
-                    resolved += 1
-                    continue
-
                 notes = disc.get("notes", {}).get("nodes", [])
                 non_system = [n for n in notes if not n.get("system", False)]
                 if not non_system:
+                    continue
+
+                if not disc.get("resolvable", False):
+                    # Non-resolvable comment — track if unanswered by me
+                    last_author = non_system[-1].get("author", {}).get("username", "")
+                    if last_author != self.username:
+                        comments += 1
+                        pending_authors.add(last_author)
+                    continue
+
+                if disc.get("resolved", False):
+                    resolved += 1
                     continue
 
                 first_author = non_system[0].get("author", {}).get("username", "")
@@ -1062,15 +1072,16 @@ class GitLabSync:
                         pending += 1
                         pending_authors.add(last_author)
 
-            if pending or answered or to_close or resolved:
+            if pending or answered or to_close or resolved or comments:
                 self.mr_discussions[mr["web_url"]] = {
                     "pending": pending, "answered": answered, "to_close": to_close,
-                    "resolved": resolved, "pending_authors": pending_authors,
+                    "resolved": resolved, "comments": comments,
+                    "pending_authors": pending_authors,
                 }
 
         discussed = sum(
             1 for v in self.mr_discussions.values()
-            if v["pending"] > 0 or v["answered"] > 0 or v["to_close"] > 0
+            if v["pending"] > 0 or v["answered"] > 0 or v["to_close"] > 0 or v.get("comments", 0) > 0
         )
         print(f"  {discussed} MRs with active discussions", file=sys.stderr)
 
@@ -1374,12 +1385,12 @@ class GitLabSync:
 
         active_mr_urls = {mr["web_url"] for mr in self.mrs if not self._is_on_hold(mr)}
 
-        # Pending threads first
+        # Pending threads and unanswered comments first
         for mr in self.mrs:
             if mr["web_url"] not in active_mr_urls:
                 continue
             disc = self.mr_discussions.get(mr["web_url"], {})
-            if disc.get("pending", 0) > 0:
+            if disc.get("pending", 0) > 0 or disc.get("comments", 0) > 0:
                 act_now.append(mr)
                 act_now_urls.add(mr["web_url"])
 
