@@ -587,16 +587,28 @@ class PlainFormatter:
 
     def _render_team_mr_line(self, sync, mr, show_author=True):
         author = mr.get("author", {}).get("username", "?")
-        changes = mr.get("changes_count", "")
-        size = f" | {changes} changes" if changes else ""
         title = mr["title"]
         if mr.get("draft") and not title.startswith("Draft:"):
             title = f"Draft: {title}"
         by = f" — by @{author}" if show_author else ""
-        line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {title}{by}{size}"
+        line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {title}{by}"
+
+        annotations = []
         days = sync._get_staleness(mr)
         if days >= 3:
-            line += f" | idle {days}d"
+            annotations.append(f"idle {days}d")
+
+        approved_by = mr.get("approved_by", [])
+        if approved_by:
+            names = ", ".join("@" + a for a in approved_by)
+            annotations.append(f"approved by {names}")
+
+        notes = mr.get("user_notes_count", 0)
+        if notes > 0:
+            annotations.append(f"{notes} note(s)")
+
+        if annotations:
+            line += " | " + " | ".join(annotations)
         return line
 
     def _group_by_milestone(self, team_mrs):
@@ -1198,7 +1210,10 @@ class GitLabSync:
         })
 
     def _fetch_all_group_mrs(self):
-        """Fetch all open MRs from configured groups (cached, shared by team + discussions)."""
+        """Fetch all open MRs from configured groups (cached, shared by team + discussions).
+
+        Uses GraphQL to get approvals + note counts inline.
+        """
         if hasattr(self, "_all_group_mrs"):
             return self._all_group_mrs
 
@@ -1223,13 +1238,47 @@ class GitLabSync:
 
         all_mrs = []
         for group in groups:
-            encoded_group = group.replace("/", "%2F")
-            output = self.run_command(
-                ["glab", "api",
-                 f"groups/{encoded_group}/merge_requests?state=opened&per_page=100&scope=all"]
-            )
-            if output:
-                all_mrs.extend(json.loads(output))
+            query = f'''{{
+                group(fullPath: "{group}") {{
+                    mergeRequests(state: opened, includeSubgroups: true, first: 100) {{
+                        nodes {{
+                            iid title webUrl draft
+                            approved
+                            approvedBy {{ nodes {{ username }} }}
+                            userNotesCount
+                            author {{ username id }}
+                            reference projectId updatedAt
+                            milestone {{ title dueDate }}
+                        }}
+                    }}
+                }}
+            }}'''
+            data = self.run_graphql(query)
+            if not data or not data.get("group"):
+                continue
+            for node in data["group"]["mergeRequests"]["nodes"]:
+                # Normalize to REST-like structure
+                all_mrs.append({
+                    "iid": int(node["iid"]),
+                    "title": node["title"],
+                    "web_url": node["webUrl"],
+                    "draft": node.get("draft", False),
+                    "work_in_progress": node.get("draft", False),
+                    "approved": node.get("approved", False),
+                    "approved_by": [a["username"] for a in (node.get("approvedBy") or {}).get("nodes", [])],
+                    "user_notes_count": node.get("userNotesCount", 0),
+                    "author": {
+                        "username": node.get("author", {}).get("username", "?"),
+                        "id": _gid_to_int(node.get("author", {}).get("id", 0)),
+                    },
+                    "project_id": _gid_to_int(node.get("projectId", 0)),
+                    "updated_at": node.get("updatedAt", ""),
+                    "milestone": (
+                        {"title": node["milestone"]["title"], "due_date": node["milestone"].get("dueDate")}
+                        if node.get("milestone") else None
+                    ),
+                    "references": {"full": self._group_mr_ref_full(node["webUrl"], node.get("reference", ""))},
+                })
 
         # Exclude own MRs
         other_mrs = [
@@ -1239,6 +1288,12 @@ class GitLabSync:
         self._all_group_mrs = other_mrs
         self.cache.set("all_group_mrs", other_mrs)
         return other_mrs
+
+    @staticmethod
+    def _group_mr_ref_full(web_url, reference):
+        project_path = web_url.split("/-/")[0].rstrip("/")
+        repo_name = project_path.rsplit("/", 1)[-1] if project_path else "unknown"
+        return f"{repo_name}{reference}" if reference else ""
 
     def fetch_team_mrs(self):
         """Fetch team MRs for the review list (--team only). Includes drafts."""
