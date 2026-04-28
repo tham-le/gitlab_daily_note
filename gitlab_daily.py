@@ -585,6 +585,12 @@ class PlainFormatter:
             lines.append(self._format_issue_line(issue))
         lines.append("")
 
+    @staticmethod
+    def _ci_passed(mr):
+        pipeline = mr.get("head_pipeline") or {}
+        status = pipeline.get("status", "")
+        return status in ("success", "")
+
     def _render_team_mr_line(self, sync, mr, show_author=True):
         author = mr.get("author", {}).get("username", "?")
         title = mr["title"]
@@ -594,6 +600,10 @@ class PlainFormatter:
         line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {title}{by}"
 
         annotations = []
+        pipeline = self._pipeline_status(mr)
+        if pipeline:
+            annotations.append(pipeline)
+
         days = sync._get_staleness(mr)
         if days >= 3:
             annotations.append(f"idle {days}d")
@@ -634,13 +644,14 @@ class PlainFormatter:
         lines.append("")
         lines.append("## To Review")
 
-        # Separate ready vs draft
-        ready = [mr for mr in sync.team_mrs if not mr.get("draft")]
+        non_draft = [mr for mr in sync.team_mrs if not mr.get("draft")]
         drafts = [mr for mr in sync.team_mrs if mr.get("draft")]
+
+        ready = [mr for mr in non_draft if self._ci_passed(mr)]
+        ci_pending = [mr for mr in non_draft if not self._ci_passed(mr)]
 
         for ms_title, mrs in self._group_by_milestone(ready):
             lines.append(f"### {ms_title}")
-            # Group by author within milestone
             author_groups = defaultdict(list)
             for mr in mrs:
                 author = mr.get("author", {}).get("username", "?")
@@ -650,6 +661,12 @@ class PlainFormatter:
                 lines.append(f"**@{author}** ({len(author_mrs)})")
                 for mr in author_mrs:
                     lines.append(self._render_team_mr_line(sync, mr, show_author=False))
+            lines.append("")
+
+        if ci_pending:
+            lines.append(f"### CI Pending ({len(ci_pending)})")
+            for mr in ci_pending:
+                lines.append(self._render_team_mr_line(sync, mr))
             lines.append("")
 
         if drafts:
@@ -857,8 +874,11 @@ class ObsidianFormatter(PlainFormatter):
         if sync.team_mrs:
             lines.append("---")
             lines.append("")
-            ready = [mr for mr in sync.team_mrs if not mr.get("draft")]
+            non_draft = [mr for mr in sync.team_mrs if not mr.get("draft")]
             drafts = [mr for mr in sync.team_mrs if mr.get("draft")]
+
+            ready = [mr for mr in non_draft if self._ci_passed(mr)]
+            ci_pending = [mr for mr in non_draft if not self._ci_passed(mr)]
 
             if ready:
                 for ms_title, mrs in self._group_by_milestone(ready):
@@ -872,7 +892,11 @@ class ObsidianFormatter(PlainFormatter):
                         cl.append(f"**@{author}** ({len(author_mrs)})")
                         for mr in author_mrs:
                             cl.append(self._render_team_mr_line(sync, mr, show_author=False))
-                    lines.extend(self._callout("info", f"To Review — {ms_title}", cl))
+                    lines.extend(self._callout("info", f"To Review", cl))
+
+            if ci_pending:
+                cl = [self._render_team_mr_line(sync, mr) for mr in ci_pending]
+                lines.extend(self._callout("abstract", f"CI Pending ({len(ci_pending)})", cl))
 
             if drafts:
                 cl = []
@@ -977,7 +1001,6 @@ class GitLabSync:
         if "errors" in data:
             for err in data["errors"]:
                 print(f"GraphQL error: {err.get('message', err)}", file=sys.stderr)
-            return None
         return data.get("data")
 
     # -- Todo management --
@@ -1249,6 +1272,7 @@ class GitLabSync:
                             author {{ username id }}
                             reference projectId updatedAt
                             milestone {{ title dueDate }}
+                            headPipeline {{ status }}
                         }}
                     }}
                 }}
@@ -1276,6 +1300,10 @@ class GitLabSync:
                     "milestone": (
                         {"title": node["milestone"]["title"], "due_date": node["milestone"].get("dueDate")}
                         if node.get("milestone") else None
+                    ),
+                    "head_pipeline": (
+                        {"status": _PIPELINE_STATUS_MAP.get(node["headPipeline"]["status"], node["headPipeline"]["status"].lower())}
+                        if node.get("headPipeline") else None
                     ),
                     "references": {"full": self._group_mr_ref_full(node["webUrl"], node.get("reference", ""))},
                 })
