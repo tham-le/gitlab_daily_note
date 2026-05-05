@@ -139,6 +139,7 @@ MR_FIELDS = """
     headPipeline { status }
     userNotesCount
     discussions(first: 100) {
+        pageInfo { hasNextPage }
         nodes {
             resolvable resolved
             notes(first: 100) {
@@ -274,6 +275,7 @@ def _normalize_mr(node):
         "references": {"full": full_ref},
         "author": node.get("author") or {},
         "_discussions_raw": (node.get("discussions") or {}).get("nodes", []),
+        "_discussions_has_next_page": ((node.get("discussions") or {}).get("pageInfo") or {}).get("hasNextPage", False),
     }
 
 
@@ -802,8 +804,11 @@ class ObsidianFormatter(PlainFormatter):
                 disc = sync.mr_discussions.get(mr["web_url"], {})
                 if disc.get("pending", 0) > 0 or disc.get("comments", 0) > 0:
                     cl.append(self.format_mr_line(sync, mr))
+            rendered_urls = set(mr["web_url"] for mr in cats["act_now"])
             if todos.get("build_failed"):
                 for todo in todos["build_failed"]:
+                    if todo.get("target", {}).get("web_url") in rendered_urls:
+                        continue
                     cl.append(f"- [ ] [{todo['target']['title']}]({todo['target_url']}) — **`FAILED`**")
             for mr in cats["conflict_mrs"]:
                 if mr["web_url"] not in cats["act_now_urls"]:
@@ -1064,10 +1069,50 @@ class GitLabSync:
             "mr_approvals": self.mr_approvals,
         })
 
+    def _fetch_rest_discussions(self, project_id, iid, start_page=2):
+        """Fetch discussion pages beyond what GraphQL returns (page start_page onward)."""
+        result = []
+        page = start_page
+        while True:
+            output = self.run_command([
+                "glab", "api",
+                f"projects/{project_id}/merge_requests/{iid}/discussions?per_page=100&page={page}",
+            ])
+            if not output:
+                break
+            batch = json.loads(output)
+            if not isinstance(batch, list) or not batch:
+                break
+            result.extend(batch)
+            page += 1
+        return result
+
+    @staticmethod
+    def _rest_disc_to_graphql(disc):
+        """Convert a REST discussion node to the shape _process_discussions expects."""
+        notes = disc.get("notes", [])
+        return {
+            "resolvable": any(n.get("resolvable") for n in notes),
+            "resolved": all(n.get("resolved", True) for n in notes if n.get("resolvable")),
+            "notes": {"nodes": [
+                {
+                    "system": n.get("system", False),
+                    "resolvable": n.get("resolvable", False),
+                    "resolved": n.get("resolved", False),
+                    "author": {"username": (n.get("author") or {}).get("username", "")},
+                }
+                for n in notes
+            ]},
+        }
+
     def _process_discussions(self):
         print(f"Processing discussions from {len(self.mrs)} MRs...", file=sys.stderr)
         for mr in self.mrs:
             raw_discussions = mr.pop("_discussions_raw", [])
+            has_next_page = mr.pop("_discussions_has_next_page", False)
+            if has_next_page:
+                extra = self._fetch_rest_discussions(mr["project_id"], mr["iid"])
+                raw_discussions.extend(self._rest_disc_to_graphql(d) for d in extra)
             if not raw_discussions:
                 continue
 
