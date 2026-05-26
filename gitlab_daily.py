@@ -355,8 +355,6 @@ class PlainFormatter:
             if info["approvals_left"] > 0:
                 return f"approved by {names}, needs {info['approvals_left']} more"
             return f"approved by {names}"
-        if info["approvals_required"] > 0:
-            return f"needs {info['approvals_required']} approval(s)"
         return ""
 
     def format_mr_line(self, sync, mr):
@@ -727,8 +725,6 @@ class ObsidianFormatter(PlainFormatter):
             if info["approvals_left"] > 0:
                 return f"**approved** by {names}, needs {info['approvals_left']} more"
             return f"**approved** by {names}"
-        if info["approvals_required"] > 0:
-            return f"needs {info['approvals_required']} approval(s)"
         return ""
 
     @staticmethod
@@ -1043,7 +1039,7 @@ class GitLabSync:
         self.user_id = _gid_to_int(user["id"])
         print(f"User: {self.username} (ID: {self.user_id})", file=sys.stderr)
 
-        self.todos = [_normalize_todo(t) for t in user["todos"]["nodes"]]
+        self.todos = [_normalize_todo(t) for t in user["todos"]["nodes"] if t is not None]
         print(f"Found {len(self.todos)} todos", file=sys.stderr)
 
         mrs_by_key = {}
