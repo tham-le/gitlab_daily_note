@@ -1127,9 +1127,16 @@ class GitLabSync:
                 if not non_system:
                     continue
 
+                # Use only notes with a real author to determine thread ownership.
+                # GitLab sometimes appends authorless notes (pipeline events, etc.)
+                # after a human reply, which would otherwise push last_author to "".
+                authored = [n for n in non_system if (n.get("author") or {}).get("username")]
+                if not authored:
+                    continue
+
                 if not disc.get("resolvable", False):
                     # Non-resolvable comment; track if unanswered by me
-                    last_author = (non_system[-1].get("author") or {}).get("username", "")
+                    last_author = (authored[-1].get("author") or {}).get("username", "")
                     if last_author != self.username:
                         comments += 1
                         pending_authors.add(last_author)
@@ -1139,8 +1146,8 @@ class GitLabSync:
                     resolved += 1
                     continue
 
-                first_author = (non_system[0].get("author") or {}).get("username", "")
-                last_author = (non_system[-1].get("author") or {}).get("username", "")
+                first_author = (authored[0].get("author") or {}).get("username", "")
+                last_author = (authored[-1].get("author") or {}).get("username", "")
 
                 if first_author == self.username:
                     if last_author == self.username:
@@ -1415,8 +1422,12 @@ class GitLabSync:
                 if all(n.get("resolved", False) for n in notes if n.get("resolvable")):
                     continue
 
-                first_author = (notes[0].get("author") or {}).get("username", "")
-                last_author = (notes[-1].get("author") or {}).get("username", "")
+                authored = [n for n in notes if (n.get("author") or {}).get("username")]
+                if not authored:
+                    continue
+
+                first_author = (authored[0].get("author") or {}).get("username", "")
+                last_author = (authored[-1].get("author") or {}).get("username", "")
 
                 # Only care about threads I opened where someone replied
                 if first_author == self.username and last_author != self.username:
