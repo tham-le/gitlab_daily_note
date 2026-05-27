@@ -1044,9 +1044,13 @@ class GitLabSync:
 
         mrs_by_key = {}
         for node in user["authoredMergeRequests"]["nodes"]:
+            if node is None:
+                continue
             mr = _normalize_mr(node)
             mrs_by_key[(mr["project_id"], mr["iid"])] = mr
         for node in user["assignedMergeRequests"]["nodes"]:
+            if node is None:
+                continue
             mr = _normalize_mr(node)
             mrs_by_key[(mr["project_id"], mr["iid"])] = mr
 
@@ -1116,14 +1120,16 @@ class GitLabSync:
             pending_authors = set()
 
             for disc in raw_discussions:
-                notes = disc.get("notes", {}).get("nodes", [])
+                if disc is None:
+                    continue
+                notes = [n for n in (disc.get("notes", {}).get("nodes", []) or []) if n is not None]
                 non_system = [n for n in notes if not n.get("system", False)]
                 if not non_system:
                     continue
 
                 if not disc.get("resolvable", False):
-                    # Non-resolvable comment — track if unanswered by me
-                    last_author = non_system[-1].get("author", {}).get("username", "")
+                    # Non-resolvable comment; track if unanswered by me
+                    last_author = (non_system[-1].get("author") or {}).get("username", "")
                     if last_author != self.username:
                         comments += 1
                         pending_authors.add(last_author)
@@ -1133,8 +1139,8 @@ class GitLabSync:
                     resolved += 1
                     continue
 
-                first_author = non_system[0].get("author", {}).get("username", "")
-                last_author = non_system[-1].get("author", {}).get("username", "")
+                first_author = (non_system[0].get("author") or {}).get("username", "")
+                last_author = (non_system[-1].get("author") or {}).get("username", "")
 
                 if first_author == self.username:
                     if last_author == self.username:
