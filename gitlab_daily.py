@@ -1051,16 +1051,37 @@ class GitLabSync:
 
         print(f"User: {self.username} (ID: {self.user_id})", file=sys.stderr)
 
-        self.todos = [_normalize_todo(t) for t in user["todos"]["nodes"] if t is not None]
+        todos_data = user.get("todos") or {"nodes": []}
+        self.todos = [_normalize_todo(t) for t in todos_data["nodes"] if t is not None]
         print(f"Found {len(self.todos)} todos", file=sys.stderr)
 
+        authored = user.get("authoredMergeRequests") or {"nodes": []}
+        assigned = user.get("assignedMergeRequests") or {"nodes": []}
+        mr_fields_timed_out = user.get("authoredMergeRequests") is None or user.get("assignedMergeRequests") is None
+        if mr_fields_timed_out:
+            print("Warning: MR fields timed out in GraphQL response, falling back to cache for MR data", file=sys.stderr)
+            cached = self.cache.get("main")
+            if cached:
+                self.mrs = cached["mrs"]
+                self.mr_discussions = _deserialize_discussions(cached["mr_discussions"])
+                self.mr_approvals = cached["mr_approvals"]
+                print(f"Using cached MR data: {len(self.mrs)} MRs", file=sys.stderr)
+                self.cache.set("main", {
+                    "username": self.username,
+                    "user_id": self.user_id,
+                    "todos": self.todos,
+                    "mrs": self.mrs,
+                    "mr_discussions": _serialize_discussions(self.mr_discussions),
+                    "mr_approvals": self.mr_approvals,
+                })
+                return
         mrs_by_key = {}
-        for node in user["authoredMergeRequests"]["nodes"]:
+        for node in authored["nodes"]:
             if node is None:
                 continue
             mr = _normalize_mr(node)
             mrs_by_key[(mr["project_id"], mr["iid"])] = mr
-        for node in user["assignedMergeRequests"]["nodes"]:
+        for node in assigned["nodes"]:
             if node is None:
                 continue
             mr = _normalize_mr(node)
@@ -1659,8 +1680,15 @@ class GitLabSync:
             if target and target.get("state", "") in ["closed", "merged"]:
                 stale_todos.append(todo)
                 continue
-            if todo["action_name"] in ["build_failed", "unmergeable"]:
-                categories[todo["action_name"]].append(todo)
+            if todo["action_name"] == "build_failed":
+                pipeline_status = target.get("head_pipeline", {}).get("status", "")
+                if pipeline_status == "success":
+                    stale_todos.append(todo)
+                    continue
+                categories["build_failed"].append(todo)
+                continue
+            if todo["action_name"] == "unmergeable":
+                categories["unmergeable"].append(todo)
                 continue
             if created < recent_cutoff:
                 continue
