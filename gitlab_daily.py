@@ -1415,8 +1415,8 @@ class GitLabSync:
                 if all(n.get("resolved", False) for n in notes if n.get("resolvable")):
                     continue
 
-                first_author = notes[0].get("author", {}).get("username", "")
-                last_author = notes[-1].get("author", {}).get("username", "")
+                first_author = (notes[0].get("author") or {}).get("username", "")
+                last_author = (notes[-1].get("author") or {}).get("username", "")
 
                 # Only care about threads I opened where someone replied
                 if first_author == self.username and last_author != self.username:
