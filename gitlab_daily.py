@@ -1037,6 +1037,18 @@ class GitLabSync:
         user = data["currentUser"]
         self.username = user["username"]
         self.user_id = _gid_to_int(user["id"])
+
+        # Fall back to long-lived identity cache when GraphQL times out username.
+        identity_cache = FileCache(self.base_dir, ttl=7 * 24 * 3600)
+        if not self.username:
+            cached_id = identity_cache.get("identity")
+            if cached_id:
+                self.username = cached_id["username"]
+                self.user_id = self.user_id or cached_id["user_id"]
+                print(f"User.username timed out, using cached identity: {self.username}", file=sys.stderr)
+        if self.username:
+            identity_cache.set("identity", {"username": self.username, "user_id": self.user_id})
+
         print(f"User: {self.username} (ID: {self.user_id})", file=sys.stderr)
 
         self.todos = [_normalize_todo(t) for t in user["todos"]["nodes"] if t is not None]
