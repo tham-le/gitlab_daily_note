@@ -138,18 +138,6 @@ MR_FIELDS = """
     approvedBy { nodes { username } }
     headPipeline { status }
     userNotesCount
-    discussions(first: 100) {
-        pageInfo { hasNextPage }
-        nodes {
-            resolvable resolved
-            notes(first: 100) {
-                nodes {
-                    system resolvable resolved
-                    author { username }
-                }
-            }
-        }
-    }
 """
 
 MAIN_QUERY = """
@@ -274,8 +262,6 @@ def _normalize_mr(node):
         "user_notes_count": node.get("userNotesCount", 0),
         "references": {"full": full_ref},
         "author": node.get("author") or {},
-        "_discussions_raw": (node.get("discussions") or {}).get("nodes", []),
-        "_discussions_has_next_page": ((node.get("discussions") or {}).get("pageInfo") or {}).get("hasNextPage", False),
     }
 
 
@@ -1139,13 +1125,10 @@ class GitLabSync:
         }
 
     def _process_discussions(self):
-        print(f"Processing discussions from {len(self.mrs)} MRs...", file=sys.stderr)
+        print(f"Fetching discussions for {len(self.mrs)} own MRs...", file=sys.stderr)
         for mr in self.mrs:
-            raw_discussions = mr.pop("_discussions_raw", [])
-            has_next_page = mr.pop("_discussions_has_next_page", False)
-            if has_next_page:
-                extra = self._fetch_rest_discussions(mr["project_id"], mr["iid"])
-                raw_discussions.extend(self._rest_disc_to_graphql(d) for d in extra)
+            rest = self._fetch_rest_discussions(mr["project_id"], mr["iid"], start_page=1)
+            raw_discussions = [self._rest_disc_to_graphql(d) for d in rest]
             if not raw_discussions:
                 continue
 
@@ -1681,7 +1664,8 @@ class GitLabSync:
                 stale_todos.append(todo)
                 continue
             if todo["action_name"] == "build_failed":
-                pipeline_status = target.get("head_pipeline", {}).get("status", "")
+                head_pipeline = (target or {}).get("head_pipeline") or {}
+                pipeline_status = head_pipeline.get("status", "")
                 if pipeline_status == "success":
                     stale_todos.append(todo)
                     continue
