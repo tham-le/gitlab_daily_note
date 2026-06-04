@@ -637,7 +637,9 @@ class PlainFormatter:
         ci_pending = [mr for mr in non_draft if not self._ci_passed(mr)]
 
         for ms_title, mrs in self._group_by_milestone(ready):
-            lines.append(f"### {ms_title}")
+            due = next((mr["milestone"].get("due_date") for mr in mrs if mr.get("milestone")), None)
+            suffix = f", due {due}" if due else ""
+            lines.append(f"### {ms_title} ({len(mrs)}{suffix})")
             author_groups = defaultdict(list)
             for mr in mrs:
                 author = mr.get("author", {}).get("username", "?")
@@ -879,7 +881,10 @@ class ObsidianFormatter(PlainFormatter):
                         cl.append(f"**@{author}** ({len(author_mrs)})")
                         for mr in author_mrs:
                             cl.append(self._render_team_mr_line(sync, mr, show_author=False))
-                    lines.extend(self._callout("info", f"To Review", cl))
+                    due = next((mr["milestone"].get("due_date") for mr in mrs if mr.get("milestone")), None)
+                    suffix = f", due {due}" if due else ""
+                    title = f"To Review: {ms_title} ({len(mrs)}{suffix})"
+                    lines.extend(self._callout("info", title, cl))
 
             if ci_pending:
                 cl = [self._render_team_mr_line(sync, mr) for mr in ci_pending]
