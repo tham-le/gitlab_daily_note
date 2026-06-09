@@ -975,14 +975,21 @@ class GitLabSync:
 
     # -- Shell helpers --
 
-    def run_command(self, cmd):
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            print(f"Error running command: {' '.join(cmd)}", file=sys.stderr)
-            print(f"Error: {e.stderr}", file=sys.stderr)
-            return None
+    def run_command(self, cmd, retries=3, retry_delay=5):
+        for attempt in range(retries):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return result.stdout.strip()
+            except subprocess.CalledProcessError as e:
+                is_last = attempt == retries - 1
+                if not is_last and "timed out" in e.stderr:
+                    print(f"Timeout, retrying ({attempt + 1}/{retries - 1}): {' '.join(cmd)}", file=sys.stderr)
+                    time.sleep(retry_delay)
+                    continue
+                print(f"Error running command: {' '.join(cmd)}", file=sys.stderr)
+                print(f"Error: {e.stderr}", file=sys.stderr)
+                return None
+        return None
 
     def run_graphql(self, query):
         cmd = ["glab", "api", "graphql", "-f", f"query={query}"]
