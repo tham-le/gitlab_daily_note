@@ -138,6 +138,7 @@ MR_FIELDS = """
     approvedBy { nodes { username } }
     headPipeline { status }
     userNotesCount
+    description
 """
 
 MAIN_QUERY = """
@@ -193,6 +194,25 @@ ISSUES_QUERY_TEMPLATE = """
 }}
 """
 
+
+# Matches cross-project issue refs like `namespace/project#42` or same-project `#42`.
+# Group 1: optional project path (must contain at least one slash to be cross-project).
+# Group 2: issue number.
+_ISSUE_REF_RE = re.compile(r'(?:((?:[\w.-]+/)+[\w.-]+))?#(\d+)')
+_ISSUE_URL_RE = re.compile(r'(.*)/-/(?:issues|work_items)/(\d+)')
+
+
+def _issue_url_key(url):
+    """Normalize an issue URL to (project_base, iid).
+
+    GitLab serves the same issue under both /-/issues/N and /-/work_items/N;
+    the GraphQL API returns the work_items form. Comparing raw URL strings
+    misses duplicates, so key on the project base and iid instead.
+    """
+    m = _ISSUE_URL_RE.match(url)
+    if m:
+        return (m.group(1), m.group(2))
+    return (url, "")
 
 # ---------------------------------------------------------------------------
 # Normalizers
@@ -262,6 +282,7 @@ def _normalize_mr(node):
         "user_notes_count": node.get("userNotesCount", 0),
         "references": {"full": full_ref},
         "author": node.get("author") or {},
+        "description": node.get("description", "") or "",
     }
 
 
@@ -1257,6 +1278,88 @@ class GitLabSync:
         print(f"Found {len(self.issues)} issues", file=sys.stderr)
         self.cache.set("issues", self.issues)
 
+    def fetch_mr_linked_issues(self):
+        """Discover open issues referenced in MR descriptions but not assigned to the user.
+
+        Parses each user MR's description for issue refs (`namespace/project#N` or `#N`)
+        and fetches any issue not already in self.issues. New issues are appended and
+        cached separately so build_issue_mr_links can link them.
+        """
+        if not self.mrs:
+            return
+
+        cached = self.cache.get("linked_issues")
+        known_urls = {i["web_url"] for i in self.issues}
+        if cached is not None:
+            print("Using cached linked issues...", file=sys.stderr)
+            known_keys = {_issue_url_key(u) for u in known_urls}
+            added = 0
+            for issue in cached:
+                key = _issue_url_key(issue["web_url"])
+                if key not in known_keys:
+                    self.issues.append(issue)
+                    known_keys.add(key)
+                    added += 1
+            if added:
+                print(f"  Added {added} linked issues from cache", file=sys.stderr)
+            return
+
+        print("Discovering issues linked in MR descriptions...", file=sys.stderr)
+        # Map each MR's project path (relative to gitlab.com) for resolving same-project refs.
+        gitlab_base = "https://gitlab.com/"
+        discovered = []
+        known_keys = {_issue_url_key(u) for u in known_urls}
+
+        for mr in self.mrs:
+            description = mr.get("description", "") or ""
+            if not description:
+                continue
+            project_url = mr["web_url"].split("/-/")[0].rstrip("/")
+            own_path = project_url.removeprefix(gitlab_base)
+
+            for m in _ISSUE_REF_RE.finditer(description):
+                proj_part = m.group(1)
+                issue_num = m.group(2)
+                ref_path = proj_part if proj_part else own_path
+                issue_url = f"{gitlab_base}{ref_path}/-/issues/{issue_num}"
+                if _issue_url_key(issue_url) in known_keys:
+                    continue
+                encoded = ref_path.replace("/", "%2F")
+                output = self.run_command(
+                    ["glab", "api", f"projects/{encoded}/issues/{issue_num}"]
+                )
+                if not output:
+                    continue
+                data = json.loads(output)
+                if data.get("state") != "opened":
+                    continue
+                # The API returns the canonical work_items URL, which may already
+                # be known under a different surface form than issue_url above.
+                if _issue_url_key(data["web_url"]) in known_keys:
+                    continue
+                raw_labels = data.get("labels", [])
+                labels = raw_labels if isinstance(raw_labels, list) and all(isinstance(l, str) for l in raw_labels) else []
+                issue = {
+                    "iid": str(data["iid"]),
+                    "title": data["title"],
+                    "web_url": data["web_url"],
+                    "project_id": data["project_id"],
+                    "created_at": data.get("created_at", ""),
+                    "labels": labels,
+                }
+                discovered.append(issue)
+                known_keys.add(_issue_url_key(data["web_url"]))
+
+        if discovered:
+            print(f"  Discovered {len(discovered)} linked issues from MR descriptions", file=sys.stderr)
+            self.issues.extend(discovered)
+            # Invalidate issue_mr_links so it rebuilds with the new issues included.
+            self.cache.set("issue_mr_links", None)
+        else:
+            print("  No new linked issues found", file=sys.stderr)
+
+        self.cache.set("linked_issues", discovered)
+
     def build_issue_mr_links(self):
         if not self.issues:
             return
@@ -1777,6 +1880,7 @@ class GitLabSync:
         self.fetch_main()
         self.fetch_recently_merged(date - timedelta(days=3))
         self.fetch_issues()
+        self.fetch_mr_linked_issues()
         self.build_issue_mr_links()
 
         print("\nChecking threads on group MRs...", file=sys.stderr)
