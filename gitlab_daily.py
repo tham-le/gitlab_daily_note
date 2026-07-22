@@ -1587,7 +1587,11 @@ class GitLabSync:
             return False
         full_ref = item.get("references", {}).get("full", "").lower()
         web_url = item.get("web_url", "").lower()
-        return any(p in full_ref or p in web_url for p in self.on_hold_patterns)
+        title = item.get("title", "").lower()
+        return any(
+            p in full_ref or p in web_url or p in title
+            for p in self.on_hold_patterns
+        )
 
     @staticmethod
     def _get_repo_short_name(item):
@@ -1783,6 +1787,8 @@ class GitLabSync:
                 pipeline_status = head_pipeline.get("status", "")
                 if pipeline_status == "success":
                     stale_todos.append(todo)
+                    continue
+                if self._is_on_hold(target or {}):
                     continue
                 categories["build_failed"].append(todo)
                 continue

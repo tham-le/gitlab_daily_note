@@ -2,3 +2,7 @@
 .daily-note-cache/
 .daily-note-state.json
 __pycache__/
+
+# Generated output (may contain private org data)
+daily-note/
+recap-*.md
