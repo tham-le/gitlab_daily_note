@@ -446,6 +446,13 @@ class PlainFormatter:
             lines.append(f"- {len(sync.team_mrs)} team MRs to review")
         lines.append("")
 
+        # Review Requested
+        if cats["review_requested"]:
+            lines.append("## Review Requested")
+            for mr in cats["review_requested"]:
+                lines.append(self._render_team_mr_line(sync, mr))
+            lines.append("")
+
         # Act Now
         if cats["act_now"] or todos.get("build_failed") or cats["conflict_mrs"]:
             lines.append("## Act Now")
@@ -801,6 +808,11 @@ class ObsidianFormatter(PlainFormatter):
             f" | {stats['stale_count']} | {stats['avg_age']}d |"
         )
         lines.append("")
+
+        # Review Requested
+        if cats["review_requested"]:
+            cl = [self._render_team_mr_line(sync, mr) for mr in cats["review_requested"]]
+            lines.extend(self._callout("todo", "Review Requested", cl))
 
         # Act Now
         if cats["act_now"] or todos.get("build_failed") or cats["conflict_mrs"]:
@@ -1446,52 +1458,63 @@ class GitLabSync:
 
         all_mrs = []
         for group in groups:
-            query = f'''{{
-                group(fullPath: "{group}") {{
-                    mergeRequests(state: opened, includeSubgroups: true, first: 100) {{
-                        nodes {{
-                            iid title webUrl draft
-                            approved
-                            approvedBy {{ nodes {{ username }} }}
-                            userNotesCount
-                            author {{ username id }}
-                            reference projectId updatedAt
-                            milestone {{ title dueDate }}
-                            headPipeline {{ status }}
+            cursor = ""
+            while True:
+                query = f'''{{
+                    group(fullPath: "{group}") {{
+                        mergeRequests(state: opened, includeSubgroups: true, first: 100{cursor}) {{
+                            pageInfo {{ hasNextPage endCursor }}
+                            nodes {{
+                                iid title webUrl draft
+                                approved
+                                approvedBy {{ nodes {{ username }} }}
+                                reviewers {{ nodes {{ username }} }}
+                                userNotesCount
+                                author {{ username id }}
+                                reference projectId createdAt updatedAt
+                                milestone {{ title dueDate }}
+                                headPipeline {{ status }}
+                            }}
                         }}
                     }}
-                }}
-            }}'''
-            data = self.run_graphql(query)
-            if not data or not data.get("group"):
-                continue
-            for node in data["group"]["mergeRequests"]["nodes"]:
-                # Normalize to REST-like structure
-                all_mrs.append({
-                    "iid": int(node["iid"]),
-                    "title": node["title"],
-                    "web_url": node["webUrl"],
-                    "draft": node.get("draft", False),
-                    "work_in_progress": node.get("draft", False),
-                    "approved": node.get("approved", False),
-                    "approved_by": [a["username"] for a in (node.get("approvedBy") or {}).get("nodes", [])],
-                    "user_notes_count": node.get("userNotesCount", 0),
-                    "author": {
-                        "username": node.get("author", {}).get("username", "?"),
-                        "id": _gid_to_int(node.get("author", {}).get("id", 0)),
-                    },
-                    "project_id": _gid_to_int(node.get("projectId", 0)),
-                    "updated_at": node.get("updatedAt", ""),
-                    "milestone": (
-                        {"title": node["milestone"]["title"], "due_date": node["milestone"].get("dueDate")}
-                        if node.get("milestone") else None
-                    ),
-                    "head_pipeline": (
-                        {"status": _PIPELINE_STATUS_MAP.get(node["headPipeline"]["status"], node["headPipeline"]["status"].lower())}
-                        if node.get("headPipeline") else None
-                    ),
-                    "references": {"full": self._group_mr_ref_full(node["webUrl"], node.get("reference", ""))},
-                })
+                }}'''
+                data = self.run_graphql(query)
+                if not data or not data.get("group"):
+                    break
+                page = data["group"]["mergeRequests"]
+                for node in page["nodes"]:
+                    # Normalize to REST-like structure
+                    all_mrs.append({
+                        "iid": int(node["iid"]),
+                        "title": node["title"],
+                        "web_url": node["webUrl"],
+                        "draft": node.get("draft", False),
+                        "work_in_progress": node.get("draft", False),
+                        "approved": node.get("approved", False),
+                        "approved_by": [a["username"] for a in (node.get("approvedBy") or {}).get("nodes", [])],
+                        "reviewers": [r["username"] for r in (node.get("reviewers") or {}).get("nodes", [])],
+                        "user_notes_count": node.get("userNotesCount", 0),
+                        "author": {
+                            "username": node.get("author", {}).get("username", "?"),
+                            "id": _gid_to_int(node.get("author", {}).get("id", 0)),
+                        },
+                        "project_id": _gid_to_int(node.get("projectId", 0)),
+                        "created_at": node.get("createdAt", ""),
+                        "updated_at": node.get("updatedAt", ""),
+                        "milestone": (
+                            {"title": node["milestone"]["title"], "due_date": node["milestone"].get("dueDate")}
+                            if node.get("milestone") else None
+                        ),
+                        "head_pipeline": (
+                            {"status": _PIPELINE_STATUS_MAP.get(node["headPipeline"]["status"], node["headPipeline"]["status"].lower())}
+                            if node.get("headPipeline") else None
+                        ),
+                        "references": {"full": self._group_mr_ref_full(node["webUrl"], node.get("reference", ""))},
+                    })
+                info = page.get("pageInfo") or {}
+                if not info.get("hasNextPage"):
+                    break
+                cursor = f', after: "{info["endCursor"]}"'
 
         # Exclude own MRs
         other_mrs = [
@@ -1709,6 +1732,14 @@ class GitLabSync:
             if self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0:
                 close_mrs.append(mr)
 
+        # Review Requested: team MRs where I am a reviewer and have not approved
+        review_requested = [
+            mr for mr in getattr(self, "_all_group_mrs", [])
+            if self.username in mr.get("reviewers", [])
+            and self.username not in mr.get("approved_by", [])
+        ]
+        review_requested.sort(key=lambda m: m.get("created_at", ""))
+
         # To Do: issues with no open MR (work not started yet)
         filtered_issues = self.filter_relevant_issues()
         active_issues = [i for i in filtered_issues if not self._is_on_hold(i)]
@@ -1748,6 +1779,7 @@ class GitLabSync:
             "act_now_urls": act_now_urls,
             "approved": approved,
             "close_mrs": close_mrs,
+            "review_requested": review_requested,
             "ping_reviewer": ping_reviewer,
             "in_progress": in_progress,
             "waiting": waiting,
