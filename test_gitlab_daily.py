@@ -5,6 +5,7 @@ import types
 import unittest
 from unittest import mock
 
+import gitlab_common
 import gitlab_daily as gd
 
 
@@ -178,6 +179,14 @@ class Todos(unittest.TestCase):
         with mock.patch.object(sync, "dismiss_todo") as dismiss:
             sync.cleanup_todos()
         self.assertEqual([c.args[0] for c in dismiss.call_args_list], [1, 2])
+
+
+class Paging(unittest.TestCase):
+    def test_all_pages_are_read(self):
+        pages = {"": {"x": {"nodes": [1, 2], "pageInfo": {"hasNextPage": True, "endCursor": "c"}}},
+                 ', after: "c"': {"x": {"nodes": [3], "pageInfo": {"hasNextPage": False}}}}
+        with mock.patch.object(gitlab_common, "run_graphql", lambda q: pages[q]):
+            self.assertEqual(gitlab_common.run_graphql_all(lambda after: after, ["x"]), [1, 2, 3])
 
 
 class Notes(unittest.TestCase):

@@ -99,6 +99,26 @@ def run_graphql(query):
     return data.get("data")
 
 
+def run_graphql_all(query_for_page, path):
+    """Every node of one paged connection.
+
+    query_for_page(after) returns the query text, with `after` placed right after `first: 100`.
+    path is the keys from the response data down to the connection.
+    """
+    nodes, after = [], ""
+    while True:
+        conn = run_graphql(query_for_page(after))
+        for key in path:
+            conn = (conn or {}).get(key)
+        if not conn:
+            return nodes
+        nodes += [n for n in conn.get("nodes", []) if n]
+        info = conn.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return nodes
+        after = f', after: "{info["endCursor"]}"'
+
+
 def parse_json_list(output):
     if not output:
         return []

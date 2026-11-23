@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gitlab_common import (
-    load_config, run_graphql, gid_to_int,
+    load_config, run_graphql, run_graphql_all, gid_to_int,
     get_repo_short_name, render_grouped, add_months,
 )
 
@@ -29,25 +29,13 @@ from gitlab_common import (
 MRS_QUERY_TEMPLATE = """
 {{
     currentUser {{
-        id username
-        authoredMergeRequests(
+        {source}(
             {state_filter}
             updatedAfter: "{since}"
             updatedBefore: "{until}"
-            first: 100
+            first: 100{after}
         ) {{
-            nodes {{
-                iid title webUrl state
-                createdAt mergedAt updatedAt
-                reference projectId
-            }}
-        }}
-        assignedMergeRequests(
-            {state_filter}
-            updatedAfter: "{since}"
-            updatedBefore: "{until}"
-            first: 100
-        ) {{
+            pageInfo {{ hasNextPage endCursor }}
             nodes {{
                 iid title webUrl state
                 createdAt mergedAt updatedAt
@@ -64,8 +52,9 @@ ISSUES_QUERY_TEMPLATE = """
         assigneeUsernames: ["{username}"]
         updatedAfter: "{since}"
         updatedBefore: "{until}"
-        first: 100
+        first: 100{after}
     ) {{
+        pageInfo {{ hasNextPage endCursor }}
         nodes {{
             iid title webUrl state
             createdAt closedAt
@@ -81,39 +70,26 @@ ISSUES_QUERY_TEMPLATE = """
 # ---------------------------------------------------------------------------
 
 def fetch_user_and_mrs(since, until):
-    """Fetch user info + all MRs (any state) in one call per state."""
+    """Fetch user info + all MRs (any state), authored or assigned."""
+    data = run_graphql("{ currentUser { username } }")
+    username = data["currentUser"]["username"] if data and data.get("currentUser") else None
     mrs_by_key = {}
-    username = None
-
     for state in ["opened", "merged", "closed"]:
-        state_filter = f"state: {state}"
-        query = MRS_QUERY_TEMPLATE.format(
-            state_filter=state_filter, since=since, until=until
-        )
-        data = run_graphql(query)
-        if not data:
-            continue
-
-        user = data["currentUser"]
-        if not username:
-            username = user["username"]
-
         for source in ["authoredMergeRequests", "assignedMergeRequests"]:
-            for node in user[source]["nodes"]:
+            nodes = run_graphql_all(lambda after: MRS_QUERY_TEMPLATE.format(
+                source=source, state_filter=f"state: {state}", since=since, until=until, after=after,
+            ), ["currentUser", source])
+            for node in nodes:
                 mr = _normalize_mr(node)
                 mrs_by_key[(mr["project_id"], mr["iid"])] = mr
-
     return username, list(mrs_by_key.values())
 
 
 def fetch_issues(username, since, until):
-    query = ISSUES_QUERY_TEMPLATE.format(
-        username=username, since=since, until=until
-    )
-    data = run_graphql(query)
-    if not data:
-        return []
-    return [_normalize_issue(n) for n in data["issues"]["nodes"]]
+    nodes = run_graphql_all(lambda after: ISSUES_QUERY_TEMPLATE.format(
+        username=username, since=since, until=until, after=after,
+    ), ["issues"])
+    return [_normalize_issue(n) for n in nodes]
 
 
 def _normalize_mr(node):

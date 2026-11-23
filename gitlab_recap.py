@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gitlab_common import (
-    run_command, run_graphql, parse_json_list, gid_to_int,
+    run_command, run_graphql, run_graphql_all, parse_json_list, gid_to_int,
     get_repo_short_name, group_by_repo, add_months,
 )
 
@@ -38,25 +38,13 @@ USER_QUERY_TEMPLATE = """
 MRS_QUERY_TEMPLATE = """
 {{
     user(username: "{username}") {{
-        authoredMergeRequests(
+        {source}(
             {state_filter}
             updatedAfter: "{since}"
             updatedBefore: "{until}"
-            first: 100
+            first: 100{after}
         ) {{
-            nodes {{
-                iid title webUrl state
-                createdAt mergedAt updatedAt
-                reference projectId
-                author {{ username id }}
-            }}
-        }}
-        reviewRequestedMergeRequests(
-            {state_filter}
-            updatedAfter: "{since}"
-            updatedBefore: "{until}"
-            first: 100
-        ) {{
+            pageInfo {{ hasNextPage endCursor }}
             nodes {{
                 iid title webUrl state
                 createdAt mergedAt updatedAt
@@ -74,8 +62,9 @@ ISSUES_QUERY_TEMPLATE = """
         assigneeUsernames: ["{username}"]
         updatedAfter: "{since}"
         updatedBefore: "{until}"
-        first: 100
+        first: 100{after}
     ) {{
+        pageInfo {{ hasNextPage endCursor }}
         nodes {{
             iid title webUrl state
             createdAt closedAt
@@ -107,42 +96,26 @@ def fetch_user(username):
 
 def fetch_authored_and_reviewed(username, since, until):
     """Fetch authored + reviewed MRs across all states."""
-    authored = {}
-    reviewed = {}
-
+    found = {"authoredMergeRequests": {}, "reviewRequestedMergeRequests": {}}
     for state in ["opened", "merged", "closed"]:
-        state_filter = f"state: {state}"
-        query = MRS_QUERY_TEMPLATE.format(
-            username=username, state_filter=state_filter,
-            since=since, until=until,
-        )
-        data = run_graphql(query)
-        if not data or not data.get("user"):
-            continue
-
-        user_data = data["user"]
-        for node in user_data.get("authoredMergeRequests", {}).get("nodes", []):
-            mr = _normalize_mr(node)
-            authored[(mr["project_id"], mr["iid"])] = mr
-
-        for node in user_data.get("reviewRequestedMergeRequests", {}).get("nodes", []):
-            mr = _normalize_mr(node)
-            author = mr.get("author", {}).get("username", "")
-            # Exclude self-authored from reviews
-            if author != username:
-                reviewed[(mr["project_id"], mr["iid"])] = mr
-
-    return list(authored.values()), list(reviewed.values())
+        for source, mrs in found.items():
+            nodes = run_graphql_all(lambda after: MRS_QUERY_TEMPLATE.format(
+                username=username, source=source, state_filter=f"state: {state}",
+                since=since, until=until, after=after,
+            ), ["user", source])
+            for node in nodes:
+                mr = _normalize_mr(node)
+                if source == "reviewRequestedMergeRequests" and mr.get("author", {}).get("username", "") == username:
+                    continue
+                mrs[(mr["project_id"], mr["iid"])] = mr
+    return list(found["authoredMergeRequests"].values()), list(found["reviewRequestedMergeRequests"].values())
 
 
 def fetch_issues(username, since, until):
-    query = ISSUES_QUERY_TEMPLATE.format(
-        username=username, since=since, until=until,
-    )
-    data = run_graphql(query)
-    if not data:
-        return []
-    return [_normalize_issue(n) for n in data["issues"]["nodes"]]
+    nodes = run_graphql_all(lambda after: ISSUES_QUERY_TEMPLATE.format(
+        username=username, since=since, until=until, after=after,
+    ), ["issues"])
+    return [_normalize_issue(n) for n in nodes]
 
 
 def fetch_events(user_id, since_iso):
