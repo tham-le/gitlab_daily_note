@@ -99,11 +99,12 @@ function categorize(data, cfg, now = Date.now()) {
     if (t.to_close) put("close", mr);
   }
 
+  const own = new Set(data.mrs.map((mr) => mr.web_url));
   for (const mr of data.reviewing) {
     if (mr.author?.username === me) continue;
     const { t, approvedBy } = decorate(mr);
     if (!approvedBy.includes(me)) put("review_requested", mr);
-    if (t.to_close) put("close", mr);
+    if (t.to_close && !own.has(mr.web_url)) put("close", mr);
   }
 
   const ownOpen = new Map(data.mrs.map((mr) => [mr.web_url, mr]));

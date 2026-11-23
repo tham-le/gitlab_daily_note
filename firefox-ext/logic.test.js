@@ -41,7 +41,7 @@ test("categorize sorts MRs and issues into the sections", () => {
     mr(7, { title: "VPN relay" }),                      // on hold
     mr(8),                                              // act now (build failed)
   ];
-  const reviewing = [mr(9, { author: { username: "other" } }), mr(10, { author: { username: "other" } })];
+  const reviewing = [mr(9, { author: { username: "other" } }), mr(10, { author: { username: "other" } }), mr(5, { author: { username: "other" } })];
   const url = (iid) => `https://gitlab.com/g/p/-/merge_requests/${iid}`;
   const issue = (iid, extra = {}) => ({ iid, title: `issue ${iid}`, web_url: `https://gitlab.com/g/p/-/issues/${iid}`, references: { full: `g/p#${iid}` }, labels: [], ...extra });
   const cats = categorize(
@@ -67,7 +67,7 @@ test("categorize sorts MRs and issues into the sections", () => {
   assert.deepEqual(iids(cats.ping), [3]);
   assert.deepEqual(iids(cats.waiting), [1]);
   assert.deepEqual(iids(cats.on_hold), [7]);
-  assert.deepEqual(iids(cats.review_requested), [9]);
+  assert.deepEqual(iids(cats.review_requested), [9, 5]);
   assert.deepEqual(iids(cats.todo_issues), [1]);
   assert.deepEqual(iids(cats.issues_with_mrs), [2]);
   assert.deepEqual(iids(cats.issues_with_mrs[0].mrs), [1]);
