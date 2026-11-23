@@ -1378,9 +1378,10 @@ class GitLabSync:
         if not all_group:
             return
 
+        own_urls = {mr["web_url"] for mr in self.mrs}
         participated = [
             mr for mr in all_group
-            if mr.get("user_notes_count", 0) > 0
+            if mr.get("user_notes_count", 0) > 0 and mr["web_url"] not in own_urls
         ]
         if not participated:
             return
@@ -1542,7 +1543,10 @@ class GitLabSync:
             if mr["web_url"] in active_mr_urls
             and self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0
         ]
+        own_urls = {mr["web_url"] for mr in self.mrs}
         for mr in getattr(self, "_all_group_mrs", []):
+            if mr["web_url"] in own_urls:
+                continue
             if self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0:
                 close_mrs.append(mr)
 

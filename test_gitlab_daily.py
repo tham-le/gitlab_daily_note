@@ -136,6 +136,21 @@ class Buckets(unittest.TestCase):
         self.assertEqual(ids("approved"), [4])
         self.assertEqual(ids("in_progress"), [5])
 
+    def test_assigned_mr_in_the_group_keeps_its_threads_and_shows_once(self):
+        sync = _sync()
+        mr = self.mr(1, 1, user_notes_count=3)
+        sync.mrs = [mr]
+        counts = {"pending": 1, "answered": 0, "to_close": 1, "resolved": 0, "comments": 0,
+                  "pending_authors": {"bob"}, "open_threads": []}
+        sync.mr_discussions = {mr["web_url"]: dict(counts)}
+        sync._all_group_mrs = [dict(mr)]
+        with mock.patch.object(sync, "_threads_for", return_value=dict(counts, pending=0)), \
+             mock.patch.object(sync, "_save_store"), mock.patch.object(sync, "run_command", return_value="[]"):
+            sync.fetch_team_discussions()
+        cats = sync.categorize_mrs({})
+        self.assertEqual([m["iid"] for m in cats["act_now"]], [1])
+        self.assertEqual([m["iid"] for m in cats["close_mrs"]], [1])
+
 
 class Notes(unittest.TestCase):
     def test_backslashes_in_notes_are_kept(self):
