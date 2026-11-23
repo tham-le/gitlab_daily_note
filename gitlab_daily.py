@@ -1317,8 +1317,6 @@ class GitLabSync:
             return
 
         print("Discovering issues linked in MR descriptions...", file=sys.stderr)
-        # Map each MR's project path (relative to gitlab.com) for resolving same-project refs.
-        gitlab_base = "https://gitlab.com/"
         discovered = []
         known_keys = {_issue_url_key(u) for u in known_urls}
 
@@ -1327,6 +1325,7 @@ class GitLabSync:
             if not description:
                 continue
             project_url = mr["web_url"].split("/-/")[0].rstrip("/")
+            gitlab_base = "/".join(project_url.split("/", 3)[:3]) + "/"
             own_path = project_url.removeprefix(gitlab_base)
 
             for m in _ISSUE_REF_RE.finditer(description):

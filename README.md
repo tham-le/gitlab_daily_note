@@ -6,7 +6,9 @@ Generates an action-based daily note with sections like **Act Now**, **Approved*
 
 ## Setup
 
-1. Install and authenticate [`glab`](https://gitlab.com/gitlab-org/cli)
+Needs Python 3.9 or newer (standard library only, tested on 3.14) and the [`glab`](https://gitlab.com/gitlab-org/cli) CLI. Works with gitlab.com and self-hosted GitLab: the scripts talk to whatever host `glab` is logged in to.
+
+1. Install `glab` and run `glab auth login` (add `--hostname gitlab.example.com` for a self-hosted instance)
 2. Run `python gitlab_daily.py --init` to generate a `.daily-note.json` config
 3. Edit the config:
    ```json
@@ -99,6 +101,15 @@ Each MR line can show: `FAILED` | `running` | `idle Xd` | `needs rebase` | `appr
 | `on_hold_label` | Section heading for on-hold items |
 | `stale_days` | Days before flagging an MR for pinging (default: 7) |
 
-## Legacy scripts
+## Other scripts
 
-Previous versions are preserved in `old_scripts/` for reference.
+All use the same `glab` login.
+
+```
+python gitlab_monthly_resume.py --last          # MRs and issues of last month
+python gitlab_recap.py @username --months 6     # A user's MRs, issues, reviews and comments
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
