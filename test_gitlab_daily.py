@@ -118,6 +118,14 @@ class Reviews(unittest.TestCase):
         sync.review_state = {mk(2)["web_url"]: "reviewed", mk(3)["web_url"]: "unreviewed"}
         self.assertEqual([m["iid"] for m in sync.categorize_mrs({})["review_requested"]], [1, 3])
 
+    def test_review_state_is_read_when_no_group_mr_has_comments(self):
+        sync = _sync()
+        sync._all_group_mrs = [{"iid": 1, "title": "t", "web_url": "u/1", "project_id": 1, "reviewers": ["me"]}]
+        reply = '[{"user": {"username": "me"}, "state": "reviewed"}]'
+        with mock.patch.object(sync, "run_command", return_value=reply):
+            sync.fetch_team_discussions()
+        self.assertEqual(sync.categorize_mrs({})["review_requested"], [])
+
 
 class Buckets(unittest.TestCase):
     @staticmethod

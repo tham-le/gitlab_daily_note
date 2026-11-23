@@ -1379,6 +1379,7 @@ class GitLabSync:
         all_group = self._fetch_all_group_mrs()
         if not all_group:
             return
+        self._fetch_review_states(all_group)
 
         own_urls = {mr["web_url"] for mr in self.mrs}
         participated = [
@@ -1400,7 +1401,15 @@ class GitLabSync:
                 }
         self._save_store(keep={mr["web_url"] for mr in self.mrs} | {mr["web_url"] for mr in all_group})
 
-        # GitLab's own reviewer state: "unreviewed" comes back when the author asks again
+        team_discussed = sum(
+            1 for mr in all_group
+            if mr["web_url"] in self.mr_discussions
+        )
+        if team_discussed:
+            print(f"  {team_discussed} team MRs with threads to close", file=sys.stderr)
+
+    def _fetch_review_states(self, all_group):
+        """GitLab's own reviewer state: "unreviewed" comes back when the author asks again."""
         for mr in all_group:
             if self.username not in mr.get("reviewers", []) or self.username in mr.get("approved_by", []):
                 continue
@@ -1410,13 +1419,6 @@ class GitLabSync:
             for r in json.loads(output) if output else []:
                 if (r.get("user") or {}).get("username") == self.username:
                     self.review_state[mr["web_url"]] = r.get("state", "")
-
-        team_discussed = sum(
-            1 for mr in all_group
-            if mr["web_url"] in self.mr_discussions
-        )
-        if team_discussed:
-            print(f"  {team_discussed} team MRs with threads to close", file=sys.stderr)
 
     # -- Helpers --
 
