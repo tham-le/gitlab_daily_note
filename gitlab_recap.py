@@ -222,8 +222,9 @@ def generate_recap(user, mrs, reviewed_mrs, issues, events, since_date, until_da
     name = user["name"]
     username = user["username"]
 
+    since = since_date.strftime("%Y-%m-%d")
     merged = sorted(
-        [mr for mr in mrs if mr.get("state") == "merged" and mr.get("merged_at")],
+        [mr for mr in mrs if mr.get("state") == "merged" and (mr.get("merged_at") or "") >= since],
         key=lambda m: m["merged_at"],
     )
     opened = [mr for mr in mrs if mr.get("state") == "opened"]
@@ -234,7 +235,7 @@ def generate_recap(user, mrs, reviewed_mrs, issues, events, since_date, until_da
     for mr in merged:
         merged_by_month[mr["merged_at"][:7]].append(mr)
 
-    closed_issues = [i for i in issues if i.get("state") == "closed"]
+    closed_issues = [i for i in issues if i.get("state") == "closed" and (i.get("closed_at") or "") >= since]
     open_issues = [i for i in issues if i.get("state") == "opened"]
 
     comment_events = [e for e in events if e.get("action_name") == "commented on"]

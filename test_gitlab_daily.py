@@ -8,6 +8,7 @@ from unittest import mock
 import gitlab_common
 import gitlab_daily as gd
 import gitlab_monthly_resume as monthly
+import gitlab_recap as recap
 
 
 def _sync():
@@ -202,6 +203,18 @@ class Monthly(unittest.TestCase):
         ]
         merged, opened, carried = monthly.categorize_mrs(mrs, since, until)
         self.assertEqual(([m["iid"] for m in merged], [m["iid"] for m in opened], [m["iid"] for m in carried]), ([1], [2], [4]))
+
+
+class Recap(unittest.TestCase):
+    def test_merges_before_the_period_are_left_out(self):
+        from datetime import datetime
+        mr = lambda i, merged: {"iid": i, "title": f"t{i}", "web_url": f"https://x/g/p/-/merge_requests/{i}",
+                                "state": "merged", "merged_at": merged, "created_at": merged, "references": {"full": "p!1"}}
+        user = {"id": 1, "username": "me", "name": "Me"}
+        out = recap.generate_recap(user, [mr(1, "2025-12-02T00:00:00Z"), mr(2, "2026-06-02T00:00:00Z")], [], [], [],
+                                   datetime(2026, 5, 1), datetime(2026, 11, 1))
+        self.assertIn("merge_requests/2)", out)
+        self.assertNotIn("merge_requests/1)", out)
 
 
 class Notes(unittest.TestCase):
