@@ -915,10 +915,10 @@ class GitLabSync:
     # -- Data fetching --
 
     def _cache_set(self, key, data, failed_before):
-        """Skip the cache when calls were lost to throttling, so the next run refetches."""
+        """Skip the cache when calls failed, so the next run refetches."""
         lost = self.failed_calls - failed_before
         if lost:
-            print(f"  {lost} calls lost to throttling, not caching {key}", file=sys.stderr)
+            print(f"  {lost} calls failed, not caching {key}", file=sys.stderr)
             return
         self.cache.set(key, data)
 
@@ -1002,11 +1002,13 @@ class GitLabSync:
         result = []
         page = 1
         while True:
+            failed_before = self.failed_calls
             output = self.run_command([
                 "glab", "api",
                 f"projects/{project_id}/merge_requests/{iid}/discussions?per_page={PER_PAGE}&page={page}",
             ])
-            if not output:
+            if output is None:
+                self.failed_calls = max(self.failed_calls, failed_before + 1)
                 break
             batch = json.loads(output)
             if not isinstance(batch, list):

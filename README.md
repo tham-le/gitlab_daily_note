@@ -37,7 +37,7 @@ python gitlab_daily.py --config path            # Use a custom config file
 
 ## How it works
 
-Uses the GitLab **GraphQL API** for MRs, todos, issues and approvals, and REST for MR discussions and issue-MR links. REST calls are paced to gitlab.com's limit of 100 requests per minute per user and retried on HTTP 429. A run that lost calls to throttling is not cached, so the next run refetches.
+Uses the GitLab **GraphQL API** for MRs, todos, issues and approvals, and REST for MR discussions and issue-MR links. REST calls are paced to gitlab.com's limit of 100 requests per minute per user and retried on HTTP 429. A run with a failed call is not cached, so the next run refetches.
 
 **API caching**: Responses are cached for 5 minutes in `.daily-note-cache/`. Re-runs within that window are instant.
 

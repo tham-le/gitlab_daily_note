@@ -52,6 +52,14 @@ class RunCommand(unittest.TestCase):
             self.assertIsNone(sync.run_command(["glab", "api", "x"]))
         self.assertEqual(sync.failed_calls, 1)
 
+    def test_failed_discussions_are_not_stored(self):
+        sync = _sync()
+        mr = {"web_url": "u/1", "project_id": 1, "iid": 1, "updated_at": "t"}
+        with mock.patch.object(gd.subprocess, "run", _fail("glab: HTTP 502\n")), mock.patch.object(sync, "_store", return_value={}) as store:
+            sync._threads_for(mr)
+        self.assertEqual(store.return_value, {})
+        self.assertEqual(sync.failed_calls, 1)
+
     def test_throttle_waits_when_window_full(self):
         sync = _sync()
         clock = [1000.0]
