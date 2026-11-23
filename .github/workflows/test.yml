@@ -1,0 +1,16 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python test_gitlab_daily.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node --test
+        working-directory: firefox-ext
