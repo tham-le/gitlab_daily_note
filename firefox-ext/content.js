@@ -144,9 +144,11 @@
       seen.add(k);
       // New MR dashboard rows are div cells; the old issuable list is li.
       const row = a.closest('[data-testid="merge-request"], li, tr') || a.parentElement;
-      if (row.querySelector(".gt-chip")) continue;
       const chip = el("span", `gt-chip gl-badge badge badge-pill ${BADGE[KIND[x.section]]}`, TITLE[x.section]);
       if (x.tags?.length) chip.append(el("small", "", " " + x.tags.join(" | ")));
+      const old = row.querySelector(".gt-chip");
+      if (old?.className === chip.className && old.textContent === chip.textContent) continue;
+      old?.remove();
       // Next to GitLab's comment count when the row has one, else after the link.
       const meta = row.querySelector('li[data-testid="issuable-comments"], [role="cell"] > div:has(svg[data-testid="comments-icon"])');
       (meta || a).after(chip);
