@@ -964,20 +964,13 @@ class GitLabSync:
         assigned = user.get("assignedMergeRequests") or {"nodes": []}
         mr_fields_timed_out = user.get("authoredMergeRequests") is None or user.get("assignedMergeRequests") is None
         if mr_fields_timed_out:
-            print("Warning: MR fields timed out in GraphQL response, falling back to cache for MR data", file=sys.stderr)
-            cached = self.cache.get("main")
-            if cached:
-                self.mrs = cached["mrs"]
-                self.mr_discussions = _deserialize_discussions(cached["mr_discussions"])
-                print(f"Using cached MR data: {len(self.mrs)} MRs", file=sys.stderr)
-                self.cache.set("main", {
-                    "username": self.username,
-                    "user_id": self.user_id,
-                    "todos": self.todos,
-                    "mrs": self.mrs,
-                    "mr_discussions": _serialize_discussions(self.mr_discussions),
-                })
-                return
+            stale = FileCache(self.base_dir, ttl=STORE_TTL).get("main")
+            if not stale:
+                sys.exit("MR fields timed out and no earlier MR data is cached, not writing an empty note")
+            self.mrs = stale["mrs"]
+            self.mr_discussions = _deserialize_discussions(stale["mr_discussions"])
+            print(f"Warning: MR fields timed out, using {len(self.mrs)} MRs from an earlier run", file=sys.stderr)
+            return
         mrs_by_key = {}
         for node in authored["nodes"]:
             if node is None:
