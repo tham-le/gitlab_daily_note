@@ -1,0 +1,13 @@
+.gt-pill {
+  position: fixed; right: 16px; bottom: 16px; z-index: 10001;
+  padding: 4px 10px; border-radius: 14px; border: 1px solid #8888;
+  background: var(--gl-background-color-default, Canvas); color: var(--gl-text-color-default, CanvasText);
+  font: 12px system-ui, sans-serif; opacity: .8; cursor: pointer;
+}
+.gt-pill:hover { opacity: 1; }
+.gt-pill.gt-err { color: #d33; border-color: #d33; opacity: 1; }
+.gt-chip { margin-left: 8px; vertical-align: middle; white-space: nowrap; border: 1px solid #8886; }
+.gt-chip small { opacity: .75; }
+ul.issuable-list { display: flex; flex-direction: column; }
+.gt-header { font-weight: 600; padding: 8px 16px; background: #8881; border-bottom: 1px solid #8884; list-style: none; }
+.gt-chip:only-child, .gl-flex-col > .gt-chip { margin-left: 0; }

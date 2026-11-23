@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,6 +28,10 @@ CONFIG_FILENAME = ".daily-note.json"
 STATE_FILENAME = ".daily-note-state.json"
 CACHE_DIR_NAME = ".daily-note-cache"
 CACHE_TTL = 300  # 5 minutes
+STORE_TTL = 30 * 24 * 3600  # per-MR thread store
+SNIPPET_LEN = 80
+PER_PAGE = 100
+RATE_LIMIT_PER_MINUTE = 100  # gitlab.com burst limit per user
 
 DEFAULT_CONFIG = {
     "base_dir": "daily-note",
@@ -36,6 +40,7 @@ DEFAULT_CONFIG = {
     "on_hold_patterns": [],
     "on_hold_label": "On Hold",
     "stale_days": 7,
+    "backlog_days": 14,
 }
 
 
@@ -78,7 +83,8 @@ def generate_config(config_path=None):
         "gitlab_group": "GitLab group path for --team mode (e.g. 'my-org/my-project')",
         "on_hold_patterns": "Strings to match in MR/issue paths for 'on hold' items",
         "on_hold_label": "Section heading for on-hold items",
-        "stale_days": "Days of inactivity before an MR is flagged for pinging reviewer",
+        "stale_days": "Days of inactivity before an MR counts as stale; a failed build on a stale MR is not shown in Act Now",
+        "backlog_days": "Days of inactivity before an MR with no milestone moves to the folded Backlog block",
     }
 
     with open(config_path, "w") as f:
@@ -139,6 +145,7 @@ MR_FIELDS = """
     headPipeline { status }
     userNotesCount
     description
+    milestone { title dueDate }
 """
 
 MAIN_QUERY = """
@@ -255,8 +262,24 @@ def _gid_to_int(gid):
     return int(gid)
 
 
+def _normalize_milestone(ms):
+    return {"title": ms["title"], "due_date": ms.get("dueDate")} if ms else None
+
+
+def _snippet(body):
+    """First line of a note, short enough for one list line."""
+    first = next((l.strip() for l in (body or "").splitlines() if l.strip()), "")
+    if first.startswith("```suggestion"):
+        return "code suggestion"
+    first = first.replace("[", "(").replace("]", ")").replace("|", "/")
+    return first if len(first) <= SNIPPET_LEN else first[:SNIPPET_LEN - 3] + "..."
+
+
 def _normalize_mr(node):
     pipeline = node.get("headPipeline") or {}
+    author = dict(node.get("author") or {})
+    if author.get("id") is not None:
+        author["id"] = _gid_to_int(author["id"])
     raw_status = pipeline.get("status", "")
     ref = node.get("reference", "")
     project_path = node.get("webUrl", "").split("/-/")[0].rstrip("/")
@@ -281,8 +304,9 @@ def _normalize_mr(node):
         "merged_at": node.get("mergedAt", ""),
         "user_notes_count": node.get("userNotesCount", 0),
         "references": {"full": full_ref},
-        "author": node.get("author") or {},
+        "author": author,
         "description": node.get("description", "") or "",
+        "milestone": _normalize_milestone(node.get("milestone")),
     }
 
 
@@ -344,6 +368,29 @@ def _deserialize_discussions(data):
 class PlainFormatter:
     """Plain markdown output."""
 
+    FAILED_LABEL = "FAILED"
+    APPROVED_LABEL = "approved"
+
+    def _section(self, kind, title, content_lines, level=2, folded=False):
+        """One block of the note: a heading here, a callout in Obsidian."""
+        return [f"{'#' * level} {title}", *content_lines, ""]
+
+    @staticmethod
+    def _thread_lines(sync, mr, kinds):
+        """One sub-line per thread that waits on me, with a link to the note."""
+        out = []
+        for t in sync.mr_discussions.get(mr["web_url"], {}).get("open_threads", []):
+            if t["kind"] not in kinds:
+                continue
+            where = f" on `{t['path'].rsplit('/', 1)[-1]}`" if t.get("path") else ""
+            out.append(f"    - @{t['author']}{where}: [{t['body'] or 'open'}]({mr['web_url']}#note_{t['note_id']})")
+        return out
+
+    def _review_line(self, sync, mr):
+        ms = f" | milestone {mr['milestone']['title']}" if mr.get("milestone") else ""
+        author = mr.get("author", {}).get("username", "?")
+        return f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']} — by @{author}{ms}"
+
     def _pipeline_status(self, mr):
         pipeline = mr.get("head_pipeline") or {}
         status = pipeline.get("status", "")
@@ -353,20 +400,17 @@ class PlainFormatter:
         }
         return labels.get(status, "")
 
-    def _approval_text(self, sync, mr):
-        info = sync.mr_approvals.get(mr["web_url"])
-        if not info:
+    def _approval_text(self, mr):
+        if mr.get("draft") or not mr.get("approved_by"):
             return ""
-        if info["approved_by"]:
-            names = ", ".join("@" + a for a in info["approved_by"])
-            if info["approvals_left"] > 0:
-                return f"approved by {names}, needs {info['approvals_left']} more"
-            return f"approved by {names}"
-        return ""
+        return f"{self.APPROVED_LABEL} by " + ", ".join("@" + a for a in mr["approved_by"])
 
     def format_mr_line(self, sync, mr):
         line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']}"
         annotations = []
+
+        if mr.get("milestone"):
+            annotations.append(f"milestone {mr['milestone']['title']}")
 
         pipeline = self._pipeline_status(mr)
         if pipeline:
@@ -376,10 +420,12 @@ class PlainFormatter:
         if days >= 3:
             annotations.append(f"idle {days}d")
 
+        if mr.get("has_conflicts", False):
+            annotations.append("conflicts")
         if mr.get("should_be_rebased", False):
             annotations.append("needs rebase")
 
-        approval = self._approval_text(sync, mr)
+        approval = self._approval_text(mr)
         if approval:
             annotations.append(approval)
 
@@ -405,40 +451,37 @@ class PlainFormatter:
         label_text = f" [{', '.join(priority_labels)}]" if priority_labels else ""
         return f"- [ ] [#{issue['iid']}]({issue['web_url']}): {issue['title']}{label_text}"
 
-    def format_markdown(self, sync, date, todos, diff=None):
-        lines = []
-        cats = sync.categorize_mrs(todos)
+    def _todo_issue_line(self, sync, issue):
+        line = self._format_issue_line(issue)
+        states = [m.get("state") for m in sync.issue_all_mrs.get(issue["web_url"], [])]
+        statuses = [f"{states.count(s)} MR {s}" for s in ("merged", "closed") if states.count(s)]
+        if statuses:
+            line += f" — {', '.join(statuses)}"
+        return line
 
-        # Header
+    @staticmethod
+    def _nav_line(sync, date):
+        def link(d, label):
+            return f"[[{sync.base_dir}/{d.strftime('%Y/%m-%b/%Y-%m-%d')}|{label}]]"
+        return f"<< {link(date - timedelta(days=1), 'Yesterday')} | {link(date + timedelta(days=1), 'Tomorrow')} >>"
+
+    def _render_header(self, sync, lines, date, stats):
         tags = sync.config.get("tags", "")
         if tags:
-            lines.append(tags)
-            lines.append("")
-        lines.append(f"# {date.strftime('%A, %B %d, %Y')}")
-
-        prev_date = date - timedelta(days=1)
-        next_date = date + timedelta(days=1)
-        base = str(sync.base_dir)
-        for d, label in [(prev_date, "Yesterday"), (next_date, "Tomorrow")]:
-            pass
-        prev_link = f"{base}/{prev_date.strftime('%Y')}/{prev_date.strftime('%m-%b')}/{prev_date.strftime('%Y-%m-%d')}"
-        next_link = f"{base}/{next_date.strftime('%Y')}/{next_date.strftime('%m-%b')}/{next_date.strftime('%Y-%m-%d')}"
-        lines.append(f"<< [[{prev_link}|Yesterday]] | [[{next_link}|Tomorrow]] >>")
-        lines.append("")
-
-        # Summary
+            lines += [tags, ""]
+        lines += [f"# {date.strftime('%A, %B %d, %Y')}", self._nav_line(sync, date), ""]
         lines.append("## Summary")
         lines.append(
-            f"- {cats['stats']['pending_threads']} pending threads"
-            f" | {cats['stats']['to_close_threads']} to close"
-            f" | {cats['stats']['build_failures']} build failures"
-            f" | {cats['stats']['conflicts']} conflicts"
+            f"- {stats['pending_threads']} pending threads"
+            f" | {stats['to_close_threads']} to close"
+            f" | {stats['build_failures']} build failures"
+            f" | {stats['conflicts']} conflicts"
         )
         lines.append(
-            f"- {cats['stats']['ready_count']} ready to merge"
-            f" | {cats['stats']['stale_count']} need a ping"
+            f"- {stats['ready_count']} ready to merge"
+            f" | {stats['stale_count']} need a ping"
             f" | {len(sync.mrs)} total open MRs"
-            f" | avg age {cats['stats']['avg_age']}d"
+            f" | avg age {stats['avg_age']}d"
         )
         if sync.recently_merged:
             lines.append(f"- {len(sync.recently_merged)} recently merged")
@@ -446,158 +489,106 @@ class PlainFormatter:
             lines.append(f"- {len(sync.team_mrs)} team MRs to review")
         lines.append("")
 
-        # Review Requested
+    def format_markdown(self, sync, date, todos, diff=None):
+        cats = sync.categorize_mrs(todos)
+        lines = []
+        self._render_header(sync, lines, date, cats["stats"])
+
         if cats["review_requested"]:
-            lines.append("## Review Requested")
-            for mr in cats["review_requested"]:
-                lines.append(self._render_team_mr_line(sync, mr))
-            lines.append("")
+            cl = [self._review_line(sync, mr) for mr in cats["review_requested"]]
+            lines += self._section("todo", "Review Owed", cl)
 
-        # Act Now
-        if cats["act_now"] or todos.get("build_failed") or cats["conflict_mrs"]:
-            lines.append("## Act Now")
-            for mr in cats["act_now"]:
-                disc = sync.mr_discussions.get(mr["web_url"], {})
-                if disc.get("pending", 0) > 0 or disc.get("comments", 0) > 0:
-                    lines.append(self.format_mr_line(sync, mr))
-            if todos.get("build_failed"):
-                for todo in todos["build_failed"]:
-                    title = todo["target"]["title"]
-                    url = todo["target_url"]
-                    lines.append(f"- [ ] [{title}]({url}) — FAILED")
-            for mr in cats["conflict_mrs"]:
-                if mr["web_url"] not in cats["act_now_urls"]:
-                    lines.append(self.format_mr_line(sync, mr))
-            lines.append("")
+        # Act Now: threads that wait on me, then builds that just failed
+        cl = []
+        for mr in cats["act_now"]:
+            cl.append(self.format_mr_line(sync, mr))
+            cl += self._thread_lines(sync, mr, ("pending", "comment"))
+        cl += [self.format_mr_line(sync, mr) for mr in cats["failed"]]
+        if cl:
+            lines += self._section("danger", "Act Now", cl)
 
-        # Threads to Close
         if cats["close_mrs"]:
-            lines.append("## Threads to Close")
+            cl = []
             for mr in cats["close_mrs"]:
                 disc = sync.mr_discussions[mr["web_url"]]
-                line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']}"
-                line += f" — {disc['to_close']} to close"
-                if disc.get("pending", 0) > 0:
-                    line += f" | {disc['pending']} pending"
-                lines.append(line)
-            lines.append("")
+                cl.append(f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']} — {disc['to_close']} to close")
+                cl += self._thread_lines(sync, mr, ("to_close",))
+            lines += self._section("warning", "Threads to Close", cl)
 
-        # To Do
-        if cats["todo_issues"]:
-            lines.append("## To Do")
-            for issue in cats["todo_issues"]:
-                line = self._format_issue_line(issue)
-                all_issue_mrs = sync.issue_all_mrs.get(issue["web_url"], [])
-                merged = sum(1 for m in all_issue_mrs if m.get("state") == "merged")
-                closed = sum(1 for m in all_issue_mrs if m.get("state") == "closed")
-                statuses = []
-                if merged:
-                    statuses.append(f"{merged} MR merged")
-                if closed:
-                    statuses.append(f"{closed} MR closed")
-                if statuses:
-                    line += f" — {', '.join(statuses)}"
-                lines.append(line)
-            lines.append("")
+        # Approved comes before new work: a rebase here is a merge
+        for key, kind, title in (
+            ("approved", "tip", "Approved"),
+            ("todo_issues", "example", "To Do"),
+            ("in_progress", "note", "In Progress"),
+        ):
+            if not cats[key]:
+                continue
+            if key == "todo_issues":
+                cl = [self._todo_issue_line(sync, issue) for issue in cats[key]]
+            else:
+                cl = [self.format_mr_line(sync, mr) for mr in cats[key]]
+            lines += self._section(kind, title, cl)
 
-        # Ping Reviewer
-        if cats["ping_reviewer"]:
-            lines.append("## Ping Reviewer")
-            for mr in cats["ping_reviewer"]:
-                lines.append(self.format_mr_line(sync, mr))
-            lines.append("")
-
-        # In Progress
-        if cats["in_progress"]:
-            lines.append("## In Progress")
-            for mr in cats["in_progress"]:
-                lines.append(self.format_mr_line(sync, mr))
-            lines.append("")
-
-        # Approved
-        if cats["approved"]:
-            lines.append("## Approved")
-            for mr in cats["approved"]:
-                lines.append(self.format_mr_line(sync, mr))
-            lines.append("")
-
-        lines.append("---")
-        lines.append("")
-
-        # Issues (reference: all issues with linked MRs)
+        lines += ["---", ""]
         self._render_issues(sync, lines, cats)
-
-        # On Hold
+        if cats["backlog"]:
+            days = sync.config.get("backlog_days", 14)
+            cl = [self.format_mr_line(sync, mr) for mr in cats["backlog"]]
+            lines += self._section(
+                "abstract", f"Backlog ({len(cl)} MRs idle {days}d or more, no milestone)", cl, folded=True)
         self._render_on_hold(sync, lines, cats)
-
-        # Team MRs
         self._render_team(sync, lines)
-
-        # Recently Merged + Changes
         self._render_changelog(sync, lines, diff)
-
-        lines.append("## Notes")
-        lines.append("- ")
+        lines += ["## Notes", "- "]
         return "\n".join(lines)
 
     def _render_issues(self, sync, lines, cats):
-        issues_with_mrs = cats["issues_with_mrs"]
-        waiting = cats["waiting"]
+        """Issues whose MRs still move. Each MR gets one full line; later mentions are short."""
+        backlog_urls = {mr["web_url"] for mr in cats["backlog"]}
+        live_urls = {mr["web_url"] for mr in sync.mrs} - backlog_urls
+        shown = set()
+        blocks = []
 
-        if not waiting and not issues_with_mrs:
-            return
-
-        lines.append("## Issues")
-        lines.append("")
-
-        all_mr_urls = {mr["web_url"] for mr in sync.mrs}
-        shown_mr_urls = set()
-
-        # Issues with linked MRs
-        first_issue = True
-        for issue in issues_with_mrs:
-            linked_mrs = [
-                mr for mr in sync.issue_to_mrs.get(issue["web_url"], [])
-                if mr["web_url"] in all_mr_urls
-            ]
-            if not linked_mrs:
+        for issue in cats["issues_with_mrs"]:
+            linked = sync.issue_to_mrs.get(issue["web_url"], [])
+            live = [mr for mr in linked if mr["web_url"] in live_urls]
+            if not live:
                 continue
-            if not first_issue:
-                lines.append("")
-            first_issue = False
-            lines.append(f"**[#{issue['iid']}]({issue['web_url']}): {issue['title']}**")
-            for mr in linked_mrs:
-                lines.append(self.format_mr_line(sync, mr))
-                shown_mr_urls.add(mr["web_url"])
+            block = [f"**[#{issue['iid']}]({issue['web_url']}): {issue['title']}**"]
+            block += [self.format_mr_line(sync, mr) for mr in live if mr["web_url"] not in shown]
+            again = [f"[!{mr['iid']}]({mr['web_url']})" for mr in live if mr["web_url"] in shown]
+            if again:
+                block.append(f"- also listed above: {', '.join(again)}")
+            parked = sum(1 for mr in linked if mr["web_url"] in backlog_urls)
+            if parked:
+                block.append(f"- {parked} more in the backlog")
+            shown.update(mr["web_url"] for mr in live)
+            blocks.append(block)
 
-        # MRs with no linked issue
-        remaining_mrs = [mr for mr in waiting if mr["web_url"] not in shown_mr_urls]
-        if remaining_mrs:
-            if issues_with_mrs:
-                lines.append("")
-            lines.append("**No linked issue:**")
-            repo_groups = defaultdict(list)
-            for mr in remaining_mrs:
-                repo = sync._get_repo_short_name(mr)
-                repo_groups[repo].append(mr)
-            for repo in sorted(repo_groups.keys()):
-                lines.append(f"*{repo}:*")
-                for mr in repo_groups[repo]:
-                    lines.append(self.format_mr_line(sync, mr))
+        orphans = [mr for mr in cats["waiting"] if mr["web_url"] not in shown]
+        if orphans:
+            block = ["**No linked issue:**"]
+            by_repo = defaultdict(list)
+            for mr in orphans:
+                by_repo[sync._get_repo_short_name(mr)].append(mr)
+            for repo in sorted(by_repo):
+                block.append(f"*{repo}:*")
+                block += [self.format_mr_line(sync, mr) for mr in by_repo[repo]]
+            blocks.append(block)
 
-        lines.append("")
+        if not blocks:
+            return
+        lines += ["## Issues", ""]
+        for block in blocks:
+            lines += [*block, ""]
 
     def _render_on_hold(self, sync, lines, cats):
         on_hold_issues = [i for i in sync.filter_relevant_issues() if sync._is_on_hold(i)]
         if not cats["on_hold_mrs"] and not on_hold_issues:
             return
-        label = sync.config.get("on_hold_label", "On Hold")
-        lines.append(f"## {label}")
-        for mr in cats["on_hold_mrs"]:
-            lines.append(self.format_mr_line(sync, mr))
-        for issue in on_hold_issues:
-            lines.append(self._format_issue_line(issue))
-        lines.append("")
+        cl = [self.format_mr_line(sync, mr) for mr in cats["on_hold_mrs"]]
+        cl += [self._format_issue_line(issue) for issue in on_hold_issues]
+        lines += self._section("quote", sync.config.get("on_hold_label", "On Hold"), cl)
 
     @staticmethod
     def _ci_passed(mr):
@@ -654,42 +645,36 @@ class PlainFormatter:
     def _render_team(self, sync, lines):
         if not sync.team_mrs:
             return
-        lines.append("---")
-        lines.append("")
-        lines.append("## To Review")
-
+        lines += ["---", ""]
         non_draft = [mr for mr in sync.team_mrs if not mr.get("draft")]
         drafts = [mr for mr in sync.team_mrs if mr.get("draft")]
-
         ready = [mr for mr in non_draft if self._ci_passed(mr)]
         ci_pending = [mr for mr in non_draft if not self._ci_passed(mr)]
 
+        milestones = []
         for ms_title, mrs in self._group_by_milestone(ready):
+            by_author = defaultdict(list)
+            for mr in mrs:
+                by_author[mr.get("author", {}).get("username", "?")].append(mr)
+            cl = []
+            for author in sorted(by_author):
+                cl.append(f"**@{author}** ({len(by_author[author])})")
+                cl += [self._render_team_mr_line(sync, mr, show_author=False) for mr in by_author[author]]
             due = next((mr["milestone"].get("due_date") for mr in mrs if mr.get("milestone")), None)
             suffix = f", due {due}" if due else ""
-            lines.append(f"### {ms_title} ({len(mrs)}{suffix})")
-            author_groups = defaultdict(list)
-            for mr in mrs:
-                author = mr.get("author", {}).get("username", "?")
-                author_groups[author].append(mr)
-            for author in sorted(author_groups.keys()):
-                author_mrs = author_groups[author]
-                lines.append(f"**@{author}** ({len(author_mrs)})")
-                for mr in author_mrs:
-                    lines.append(self._render_team_mr_line(sync, mr, show_author=False))
-            lines.append("")
+            milestones.append((f"{ms_title} ({len(mrs)}{suffix})", cl))
 
+        others = []
         if ci_pending:
-            lines.append(f"### CI Pending ({len(ci_pending)})")
-            for mr in ci_pending:
-                lines.append(self._render_team_mr_line(sync, mr))
-            lines.append("")
-
+            others.append((f"CI Pending ({len(ci_pending)})", [self._render_team_mr_line(sync, mr) for mr in ci_pending]))
         if drafts:
-            lines.append(f"### Drafts ({len(drafts)})")
-            for mr in drafts:
-                lines.append(self._render_team_mr_line(sync, mr))
-            lines.append("")
+            others.append((f"Drafts ({len(drafts)})", [self._render_team_mr_line(sync, mr) for mr in drafts]))
+        self._emit_team(lines, milestones, others)
+
+    def _emit_team(self, lines, milestones, others):
+        lines.append("## To Review")
+        for title, cl in milestones + others:
+            lines += self._section("", title, cl, level=3)
 
     def _render_changelog(self, sync, lines, diff):
         if sync.recently_merged:
@@ -723,6 +708,13 @@ class PlainFormatter:
 class ObsidianFormatter(PlainFormatter):
     """Obsidian-flavored output with callouts, frontmatter, and styled status."""
 
+    FAILED_LABEL = "**`FAILED`**"
+    APPROVED_LABEL = "**approved**"
+
+    def _section(self, kind, title, content_lines, level=2, folded=False):
+        fold = "-" if folded else ""
+        return [f"> [!{kind}]{fold} {title}", *(f"> {line}" for line in content_lines), ""]
+
     def _pipeline_status(self, mr):
         pipeline = mr.get("head_pipeline") or {}
         status = pipeline.get("status", "")
@@ -732,208 +724,50 @@ class ObsidianFormatter(PlainFormatter):
         }
         return mapping.get(status, "")
 
-    def _approval_text(self, sync, mr):
-        info = sync.mr_approvals.get(mr["web_url"])
-        if not info:
-            return ""
-        if info["approved_by"]:
-            names = ", ".join("@" + a for a in info["approved_by"])
-            if info["approvals_left"] > 0:
-                return f"**approved** by {names}, needs {info['approvals_left']} more"
-            return f"**approved** by {names}"
-        return ""
-
-    @staticmethod
-    def _callout(kind, title, content_lines):
-        result = [f"> [!{kind}] {title}"]
-        for line in content_lines:
-            result.append(f"> {line}")
-        result.append("")
-        return result
-
-    def format_markdown(self, sync, date, todos, diff=None):
-        lines = []
-        cats = sync.categorize_mrs(todos)
-        stats = cats["stats"]
-
-        # Dataview frontmatter
-        lines.append("---")
-        lines.append("type: daily-note")
-        lines.append(f"date: {date.strftime('%Y-%m-%d')}")
-        lines.append(f"open_mrs: {len(sync.mrs)}")
-        lines.append(f"pending_threads: {stats['pending_threads']}")
-        lines.append(f"to_close: {stats['to_close_threads']}")
-        lines.append(f"build_failures: {stats['build_failures']}")
-        lines.append(f"conflicts: {stats['conflicts']}")
-        lines.append(f"ready_to_merge: {stats['ready_count']}")
-        lines.append(f"stale: {stats['stale_count']}")
-        lines.append(f"avg_mr_age: {stats['avg_age']}")
+    def _render_header(self, sync, lines, date, stats):
+        lines += [
+            "---",
+            "type: daily-note",
+            f"date: {date.strftime('%Y-%m-%d')}",
+            f"open_mrs: {len(sync.mrs)}",
+            f"pending_threads: {stats['pending_threads']}",
+            f"to_close: {stats['to_close_threads']}",
+            f"build_failures: {stats['build_failures']}",
+            f"conflicts: {stats['conflicts']}",
+            f"ready_to_merge: {stats['ready_count']}",
+            f"stale: {stats['stale_count']}",
+            f"avg_mr_age: {stats['avg_age']}",
+        ]
         if sync.recently_merged:
             lines.append(f"recently_merged: {len(sync.recently_merged)}")
-        lines.append("---")
-        lines.append("")
+        lines += ["---", ""]
 
-        # Tags
         tags = sync.config.get("tags", "")
         if tags:
-            lines.append(tags)
-            lines.append("")
+            lines += [tags, ""]
+        lines += [f"# {date.strftime('%A, %B %d, %Y')}", self._nav_line(sync, date), ""]
 
-        # Header + nav
-        lines.append(f"# {date.strftime('%A, %B %d, %Y')}")
-        prev_date = date - timedelta(days=1)
-        next_date = date + timedelta(days=1)
-        base = str(sync.base_dir)
-        prev_link = f"{base}/{prev_date.strftime('%Y')}/{prev_date.strftime('%m-%b')}/{prev_date.strftime('%Y-%m-%d')}"
-        next_link = f"{base}/{next_date.strftime('%Y')}/{next_date.strftime('%m-%b')}/{next_date.strftime('%Y-%m-%d')}"
-        lines.append(f"<< [[{prev_link}|Yesterday]] | [[{next_link}|Tomorrow]] >>")
-        lines.append("")
-
-        # Progress bar
         total = len(sync.mrs)
         if total > 0:
-            pct = stats["ready_count"] / total
-            bar_len = 20
-            filled = round(pct * bar_len)
-            bar = "=" * filled + "-" * (bar_len - filled)
+            filled = round(stats["ready_count"] / total * 20)
+            bar = "=" * filled + "-" * (20 - filled)
             lines.append(f"`[{bar}]` {stats['ready_count']}/{total} ready to merge")
         lines.append("")
 
-        # Summary table
-        lines.append("| Pending | To close | Failures | Conflicts | Stale | Avg age |")
-        lines.append("|:---:|:---:|:---:|:---:|:---:|:---:|")
-        lines.append(
+        lines += [
+            "| Pending | To close | Failures | Conflicts | Stale | Avg age |",
+            "|:---:|:---:|:---:|:---:|:---:|:---:|",
             f"| {stats['pending_threads']} | {stats['to_close_threads']}"
             f" | {stats['build_failures']} | {stats['conflicts']}"
-            f" | {stats['stale_count']} | {stats['avg_age']}d |"
-        )
-        lines.append("")
+            f" | {stats['stale_count']} | {stats['avg_age']}d |",
+            "",
+        ]
 
-        # Review Requested
-        if cats["review_requested"]:
-            cl = [self._render_team_mr_line(sync, mr) for mr in cats["review_requested"]]
-            lines.extend(self._callout("todo", "Review Requested", cl))
-
-        # Act Now
-        if cats["act_now"] or todos.get("build_failed") or cats["conflict_mrs"]:
-            cl = []
-            for mr in cats["act_now"]:
-                disc = sync.mr_discussions.get(mr["web_url"], {})
-                if disc.get("pending", 0) > 0 or disc.get("comments", 0) > 0:
-                    cl.append(self.format_mr_line(sync, mr))
-            rendered_urls = set(mr["web_url"] for mr in cats["act_now"])
-            if todos.get("build_failed"):
-                for todo in todos["build_failed"]:
-                    if todo.get("target", {}).get("web_url") in rendered_urls:
-                        continue
-                    cl.append(f"- [ ] [{todo['target']['title']}]({todo['target_url']}) — **`FAILED`**")
-            for mr in cats["conflict_mrs"]:
-                if mr["web_url"] not in cats["act_now_urls"]:
-                    cl.append(self.format_mr_line(sync, mr))
-            lines.extend(self._callout("danger", "Act Now", cl))
-
-        # Threads to Close
-        if cats["close_mrs"]:
-            cl = []
-            for mr in cats["close_mrs"]:
-                disc = sync.mr_discussions[mr["web_url"]]
-                line = f"- [ ] [!{mr['iid']}]({mr['web_url']}): {mr['title']}"
-                line += f" — {disc['to_close']} to close"
-                if disc.get("pending", 0) > 0:
-                    line += f" | {disc['pending']} pending"
-                cl.append(line)
-            lines.extend(self._callout("warning", "Threads to Close", cl))
-
-        # To Do
-        if cats["todo_issues"]:
-            cl = []
-            for issue in cats["todo_issues"]:
-                line = self._format_issue_line(issue)
-                all_issue_mrs = sync.issue_all_mrs.get(issue["web_url"], [])
-                merged = sum(1 for m in all_issue_mrs if m.get("state") == "merged")
-                closed = sum(1 for m in all_issue_mrs if m.get("state") == "closed")
-                statuses = []
-                if merged:
-                    statuses.append(f"{merged} MR merged")
-                if closed:
-                    statuses.append(f"{closed} MR closed")
-                if statuses:
-                    line += f" — {', '.join(statuses)}"
-                cl.append(line)
-            lines.extend(self._callout("example", "To Do", cl))
-
-        # Ping Reviewer
-        if cats["ping_reviewer"]:
-            cl = [self.format_mr_line(sync, mr) for mr in cats["ping_reviewer"]]
-            lines.extend(self._callout("warning", "Ping Reviewer", cl))
-
-        # In Progress
-        if cats["in_progress"]:
-            cl = [self.format_mr_line(sync, mr) for mr in cats["in_progress"]]
-            lines.extend(self._callout("note", "In Progress", cl))
-
-        # Approved
-        if cats["approved"]:
-            cl = [self.format_mr_line(sync, mr) for mr in cats["approved"]]
-            lines.extend(self._callout("tip", "Approved", cl))
-
-        lines.append("---")
-        lines.append("")
-
-        # Issues (reference section)
-        self._render_issues(sync, lines, cats)
-
-        on_hold_issues = [i for i in sync.filter_relevant_issues() if sync._is_on_hold(i)]
-        if cats["on_hold_mrs"] or on_hold_issues:
-            label = sync.config.get("on_hold_label", "On Hold")
-            cl = []
-            for mr in cats["on_hold_mrs"]:
-                cl.append(self.format_mr_line(sync, mr))
-            for issue in on_hold_issues:
-                cl.append(self._format_issue_line(issue))
-            lines.extend(self._callout("quote", label, cl))
-
-        if sync.team_mrs:
-            lines.append("---")
-            lines.append("")
-            non_draft = [mr for mr in sync.team_mrs if not mr.get("draft")]
-            drafts = [mr for mr in sync.team_mrs if mr.get("draft")]
-
-            ready = [mr for mr in non_draft if self._ci_passed(mr)]
-            ci_pending = [mr for mr in non_draft if not self._ci_passed(mr)]
-
-            if ready:
-                for ms_title, mrs in self._group_by_milestone(ready):
-                    cl = []
-                    author_groups = defaultdict(list)
-                    for mr in mrs:
-                        author = mr.get("author", {}).get("username", "?")
-                        author_groups[author].append(mr)
-                    for author in sorted(author_groups.keys()):
-                        author_mrs = author_groups[author]
-                        cl.append(f"**@{author}** ({len(author_mrs)})")
-                        for mr in author_mrs:
-                            cl.append(self._render_team_mr_line(sync, mr, show_author=False))
-                    due = next((mr["milestone"].get("due_date") for mr in mrs if mr.get("milestone")), None)
-                    suffix = f", due {due}" if due else ""
-                    title = f"To Review: {ms_title} ({len(mrs)}{suffix})"
-                    lines.extend(self._callout("info", title, cl))
-
-            if ci_pending:
-                cl = [self._render_team_mr_line(sync, mr) for mr in ci_pending]
-                lines.extend(self._callout("abstract", f"CI Pending ({len(ci_pending)})", cl))
-
-            if drafts:
-                cl = []
-                for mr in drafts:
-                    cl.append(self._render_team_mr_line(sync, mr))
-                lines.extend(self._callout("abstract", f"Drafts ({len(drafts)})", cl))
-
-        self._render_changelog(sync, lines, diff)
-
-        lines.append("## Notes")
-        lines.append("- ")
-        return "\n".join(lines)
+    def _emit_team(self, lines, milestones, others):
+        for title, cl in milestones:
+            lines += self._section("info", f"To Review: {title}", cl)
+        for title, cl in others:
+            lines += self._section("abstract", title, cl)
 
 
 FORMATTERS = {"plain": PlainFormatter, "obsidian": ObsidianFormatter}
@@ -955,7 +789,10 @@ class GitLabSync:
         self.username = None
         self.user_id = None
         self.mr_discussions = {}
-        self.mr_approvals = {}
+        self.failed_calls = 0
+        self.store_hits = 0
+        self.review_state = {}
+        self._call_times = deque()
         self.issue_to_mrs = defaultdict(list)
         self.issue_all_mrs = defaultdict(list)
         self.mr_to_issues = defaultdict(list)
@@ -967,21 +804,10 @@ class GitLabSync:
 
     # -- Paths --
 
-    def get_daily_note_path(self, date):
-        year = date.strftime("%Y")
-        month = date.strftime("%m-%b")
-        filename = date.strftime("%Y-%m-%d.md")
-        folder = self.base_dir / year / month
+    def get_daily_note_path(self, date, suffix=""):
+        folder = self.base_dir / date.strftime("%Y") / date.strftime("%m-%b")
         folder.mkdir(parents=True, exist_ok=True)
-        return folder / filename
-
-    def get_snapshot_path(self, date):
-        year = date.strftime("%Y")
-        month = date.strftime("%m-%b")
-        filename = date.strftime("%Y-%m-%d-snapshot.md")
-        folder = self.base_dir / year / month
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder / filename
+        return folder / f"{date.strftime('%Y-%m-%d')}{suffix}.md"
 
     # -- Note merging --
 
@@ -1008,32 +834,66 @@ class GitLabSync:
 
     # -- Shell helpers --
 
-    def run_command(self, cmd, retries=3, retry_delay=5):
+    def _throttle(self):
+        """Keep glab calls under the per-minute limit; sleep when the window is full."""
+        now = time.monotonic()
+        while self._call_times and now - self._call_times[0] >= 60:
+            self._call_times.popleft()
+        if len(self._call_times) >= RATE_LIMIT_PER_MINUTE:
+            wait = 60 - (now - self._call_times.popleft())
+            print(f"Rate limit window full, waiting {wait:.0f}s", file=sys.stderr)
+            time.sleep(wait)
+        self._call_times.append(time.monotonic())
+
+    def run_command(self, cmd, retries=5, retry_delay=5):
         for attempt in range(retries):
+            self._throttle()
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                 return result.stdout.strip()
             except subprocess.CalledProcessError as e:
-                is_last = attempt == retries - 1
-                if not is_last and "timed out" in e.stderr:
-                    print(f"Timeout, retrying ({attempt + 1}/{retries - 1}): {' '.join(cmd)}", file=sys.stderr)
-                    time.sleep(retry_delay)
+                rate_limited = "HTTP 429" in e.stderr
+                transient = rate_limited or "timed out" in e.stderr
+                if transient and attempt < retries - 1:
+                    delay = retry_delay * 2**attempt
+                    reason = "Rate limited" if rate_limited else "Timeout"
+                    print(f"{reason}, retrying in {delay}s ({attempt + 1}/{retries - 1}): {' '.join(cmd)}", file=sys.stderr)
+                    time.sleep(delay)
                     continue
+                if transient:
+                    self.failed_calls += 1
                 print(f"Error running command: {' '.join(cmd)}", file=sys.stderr)
                 print(f"Error: {e.stderr}", file=sys.stderr)
                 return None
         return None
 
-    def run_graphql(self, query):
+    def run_graphql(self, query, retries=3, retry_delay=5):
+        # glab exits 1 when the response has "errors" but still prints the body.
+        # GitLab puts partial data next to per-field timeout errors; keep it.
         cmd = ["glab", "api", "graphql", "-f", f"query={query}"]
-        output = self.run_command(cmd)
-        if not output:
-            return None
-        data = json.loads(output)
-        if "errors" in data:
-            for err in data["errors"]:
-                print(f"GraphQL error: {err.get('message', err)}", file=sys.stderr)
-        return data.get("data")
+        for attempt in range(retries):
+            self._throttle()
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                body = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                body = {}
+            errors = body.get("errors") or []
+            timeouts = [e for e in errors if "Timeout" in str(e.get("message", ""))]
+            if timeouts and attempt < retries - 1:
+                print(f"GraphQL timeout on {len(timeouts)} fields, retrying ({attempt + 1}/{retries - 1})", file=sys.stderr)
+                time.sleep(retry_delay)
+                continue
+            for err in errors:
+                if err not in timeouts:
+                    print(f"GraphQL error: {err.get('message', err)}", file=sys.stderr)
+            if timeouts:
+                print(f"GraphQL timeout on {len(timeouts)} fields, using partial data", file=sys.stderr)
+            data = body.get("data")
+            if not data:
+                print("Error running command: glab api graphql", file=sys.stderr)
+                print(f"Error: {result.stderr}", file=sys.stderr)
+            return data
 
     # -- Todo management --
 
@@ -1046,6 +906,14 @@ class GitLabSync:
 
     # -- Data fetching --
 
+    def _cache_set(self, key, data, failed_before):
+        """Skip the cache when calls were lost to throttling, so the next run refetches."""
+        lost = self.failed_calls - failed_before
+        if lost:
+            print(f"  {lost} calls lost to throttling, not caching {key}", file=sys.stderr)
+            return
+        self.cache.set(key, data)
+
     def fetch_main(self):
         cached = self.cache.get("main")
         if cached:
@@ -1055,15 +923,13 @@ class GitLabSync:
             self.todos = cached["todos"]
             self.mrs = cached["mrs"]
             self.mr_discussions = _deserialize_discussions(cached["mr_discussions"])
-            self.mr_approvals = cached["mr_approvals"]
             print(f"User: {self.username} | {len(self.todos)} todos | {len(self.mrs)} MRs", file=sys.stderr)
             return
 
         print("Fetching user, todos, and MRs (GraphQL)...", file=sys.stderr)
         data = self.run_graphql(MAIN_QUERY)
         if not data:
-            print("GraphQL main query failed", file=sys.stderr)
-            return
+            sys.exit("GraphQL main query failed, not writing an empty note")
 
         user = data["currentUser"]
         self.username = user["username"]
@@ -1095,7 +961,6 @@ class GitLabSync:
             if cached:
                 self.mrs = cached["mrs"]
                 self.mr_discussions = _deserialize_discussions(cached["mr_discussions"])
-                self.mr_approvals = cached["mr_approvals"]
                 print(f"Using cached MR data: {len(self.mrs)} MRs", file=sys.stderr)
                 self.cache.set("main", {
                     "username": self.username,
@@ -1103,7 +968,6 @@ class GitLabSync:
                     "todos": self.todos,
                     "mrs": self.mrs,
                     "mr_discussions": _serialize_discussions(self.mr_discussions),
-                    "mr_approvals": self.mr_approvals,
                 })
                 return
         mrs_by_key = {}
@@ -1121,133 +985,133 @@ class GitLabSync:
         self.mrs = list(mrs_by_key.values())
         print(f"Found {len(self.mrs)} MRs", file=sys.stderr)
 
+        failed_before = self.failed_calls
         self._process_discussions()
-        self._process_approvals()
 
-        self.cache.set("main", {
+        self._cache_set("main", {
             "username": self.username,
             "user_id": self.user_id,
             "todos": self.todos,
             "mrs": self.mrs,
             "mr_discussions": _serialize_discussions(self.mr_discussions),
-            "mr_approvals": self.mr_approvals,
-        })
+        }, failed_before)
 
-    def _fetch_rest_discussions(self, project_id, iid, start_page=2):
-        """Fetch discussion pages beyond what GraphQL returns (page start_page onward)."""
+    def _fetch_rest_discussions(self, project_id, iid):
+        """Fetch every discussion page of one MR."""
         result = []
-        page = start_page
+        page = 1
         while True:
             output = self.run_command([
                 "glab", "api",
-                f"projects/{project_id}/merge_requests/{iid}/discussions?per_page=100&page={page}",
+                f"projects/{project_id}/merge_requests/{iid}/discussions?per_page={PER_PAGE}&page={page}",
             ])
             if not output:
                 break
             batch = json.loads(output)
-            if not isinstance(batch, list) or not batch:
+            if not isinstance(batch, list):
                 break
             result.extend(batch)
+            if len(batch) < PER_PAGE:
+                break
             page += 1
         return result
 
-    @staticmethod
-    def _rest_disc_to_graphql(disc):
-        """Convert a REST discussion node to the shape _process_discussions expects."""
-        notes = disc.get("notes", [])
-        return {
-            "resolvable": any(n.get("resolvable") for n in notes),
-            "resolved": all(n.get("resolved", True) for n in notes if n.get("resolvable")),
-            "notes": {"nodes": [
-                {
-                    "system": n.get("system", False),
-                    "resolvable": n.get("resolvable", False),
-                    "resolved": n.get("resolved", False),
-                    "author": {"username": (n.get("author") or {}).get("username", "")},
-                }
-                for n in notes
-            ]},
-        }
+    _THREAD_COUNTS = ("pending", "answered", "to_close", "resolved", "comments")
+
+    def _classify_threads(self, discussions):
+        """Count one MR's threads by who has to act next."""
+        counts = {k: 0 for k in self._THREAD_COUNTS}
+        counts["pending_authors"] = set()
+        counts["open_threads"] = []
+
+        def waits_on_me(kind, authored):
+            pos = authored[0].get("position") or {}
+            counts["open_threads"].append({
+                "kind": kind,
+                "author": authored[-1]["author"]["username"],
+                "note_id": authored[-1].get("id"),
+                "path": pos.get("new_path") or pos.get("old_path") or "",
+                "body": _snippet(authored[-1].get("body")),
+            })
+
+        for disc in discussions:
+            notes = [n for n in disc.get("notes", []) if not n.get("system", False)]
+            authored = [n for n in notes if (n.get("author") or {}).get("username")]
+            if not authored:
+                continue
+            first = authored[0]["author"]["username"]
+            last = authored[-1]["author"]["username"]
+            resolvable = [n for n in notes if n.get("resolvable", False)]
+            if not resolvable:
+                # Plain comment: mine to answer unless I spoke last
+                if last != self.username:
+                    counts["comments"] += 1
+                    counts["pending_authors"].add(last)
+                    waits_on_me("comment", authored)
+            elif all(n.get("resolved", False) for n in resolvable):
+                counts["resolved"] += 1
+            elif last == self.username:
+                counts["answered"] += 1
+            elif first == self.username:
+                counts["to_close"] += 1
+                waits_on_me("to_close", authored)
+            else:
+                counts["pending"] += 1
+                counts["pending_authors"].add(last)
+                waits_on_me("pending", authored)
+        return counts
+
+    # -- Per-MR thread store: refetch an MR only when it moved or still waits on me --
+
+    def _store(self):
+        if not hasattr(self, "_thread_store"):
+            self._store_cache = FileCache(self.base_dir, ttl=STORE_TTL)
+            self._thread_store = self._store_cache.get("threads") or {}
+        return self._thread_store
+
+    def _save_store(self, keep=None):
+        store = self._store()
+        if keep:
+            for url in [u for u in store if u not in keep]:
+                del store[url]
+        self._store_cache.set("threads", store)
+
+    def _threads_for(self, mr, open_kinds=("pending", "comment", "to_close")):
+        """Thread counts of one MR, from the store when nothing can have changed."""
+        store = self._store()
+        entry = store.get(mr["web_url"])
+        if entry and entry["updated_at"] == mr.get("updated_at") and not entry["open"]:
+            self.store_hits += 1
+            counts = dict(entry["counts"])
+            counts["pending_authors"] = set(counts["pending_authors"])
+            return counts
+        failed_before = self.failed_calls
+        discussions = self._fetch_rest_discussions(mr["project_id"], mr["iid"])
+        counts = self._classify_threads(discussions)
+        if self.failed_calls == failed_before:
+            stored = dict(counts)
+            stored["pending_authors"] = sorted(counts["pending_authors"])
+            store[mr["web_url"]] = {
+                "updated_at": mr.get("updated_at"),
+                "open": any(t["kind"] in open_kinds for t in counts["open_threads"]),
+                "counts": stored,
+            }
+        return counts
 
     def _process_discussions(self):
         print(f"Fetching discussions for {len(self.mrs)} own MRs...", file=sys.stderr)
         for mr in self.mrs:
-            rest = self._fetch_rest_discussions(mr["project_id"], mr["iid"], start_page=1)
-            raw_discussions = [self._rest_disc_to_graphql(d) for d in rest]
-            if not raw_discussions:
-                continue
-
-            pending = answered = to_close = resolved = comments = 0
-            pending_authors = set()
-
-            for disc in raw_discussions:
-                if disc is None:
-                    continue
-                notes = [n for n in (disc.get("notes", {}).get("nodes", []) or []) if n is not None]
-                non_system = [n for n in notes if not n.get("system", False)]
-                if not non_system:
-                    continue
-
-                # Use only notes with a real author to determine thread ownership.
-                # GitLab sometimes appends authorless notes (pipeline events, etc.)
-                # after a human reply, which would otherwise push last_author to "".
-                authored = [n for n in non_system if (n.get("author") or {}).get("username")]
-                if not authored:
-                    continue
-
-                if not disc.get("resolvable", False):
-                    # Non-resolvable comment; track if unanswered by me
-                    last_author = (authored[-1].get("author") or {}).get("username", "")
-                    if last_author != self.username:
-                        comments += 1
-                        pending_authors.add(last_author)
-                    continue
-
-                if disc.get("resolved", False):
-                    resolved += 1
-                    continue
-
-                first_author = (authored[0].get("author") or {}).get("username", "")
-                last_author = (authored[-1].get("author") or {}).get("username", "")
-
-                if first_author == self.username:
-                    if last_author == self.username:
-                        answered += 1
-                    else:
-                        to_close += 1
-                else:
-                    if last_author == self.username:
-                        answered += 1
-                    else:
-                        pending += 1
-                        pending_authors.add(last_author)
-
-            if pending or answered or to_close or resolved or comments:
-                self.mr_discussions[mr["web_url"]] = {
-                    "pending": pending, "answered": answered, "to_close": to_close,
-                    "resolved": resolved, "comments": comments,
-                    "pending_authors": pending_authors,
-                }
+            counts = self._threads_for(mr)
+            if any(counts[k] for k in self._THREAD_COUNTS):
+                self.mr_discussions[mr["web_url"]] = counts
+        self._save_store()
+        print(f"  {self.store_hits} unchanged MRs read from the store", file=sys.stderr)
 
         discussed = sum(
             1 for v in self.mr_discussions.values()
             if v["pending"] > 0 or v["answered"] > 0 or v["to_close"] > 0 or v.get("comments", 0) > 0
         )
         print(f"  {discussed} MRs with active discussions", file=sys.stderr)
-
-    def _process_approvals(self):
-        print("Processing approvals...", file=sys.stderr)
-        for mr in self.mrs:
-            if mr.get("draft", False):
-                continue
-            approved_by = mr.get("approved_by", [])
-            self.mr_approvals[mr["web_url"]] = {
-                "approved_by": approved_by,
-                "approvals_required": 1 if not approved_by else 0,
-                "approvals_left": 0 if approved_by else 1,
-            }
-        approved_count = sum(1 for v in self.mr_approvals.values() if v["approved_by"])
-        print(f"  {approved_count} MRs have approvals", file=sys.stderr)
 
     def fetch_recently_merged(self, since_date):
         cached = self.cache.get("merged")
@@ -1319,6 +1183,7 @@ class GitLabSync:
         print("Discovering issues linked in MR descriptions...", file=sys.stderr)
         discovered = []
         known_keys = {_issue_url_key(u) for u in known_urls}
+        failed_before = self.failed_calls
 
         for mr in self.mrs:
             description = mr.get("description", "") or ""
@@ -1369,7 +1234,7 @@ class GitLabSync:
         else:
             print("  No new linked issues found", file=sys.stderr)
 
-        self.cache.set("linked_issues", discovered)
+        self._cache_set("linked_issues", discovered, failed_before)
 
     def build_issue_mr_links(self):
         if not self.issues:
@@ -1391,6 +1256,7 @@ class GitLabSync:
             return
 
         print(f"Fetching issue-MR links ({len(self.issues)} issues)...", file=sys.stderr)
+        failed_before = self.failed_calls
         mr_url_set = {mr["web_url"] for mr in self.mrs}
         mr_by_url = {mr["web_url"]: mr for mr in self.mrs}
 
@@ -1423,10 +1289,10 @@ class GitLabSync:
         linked = sum(1 for v in self.issue_to_mrs.values() if v)
         print(f"  {linked} issues linked to open MRs", file=sys.stderr)
 
-        self.cache.set("issue_mr_links", {
+        self._cache_set("issue_mr_links", {
             "issue_to_mrs": cache_issue_to_mrs,
             "issue_all_mrs": cache_issue_all_mrs,
-        })
+        }, failed_before)
 
     def _fetch_all_group_mrs(self):
         """Fetch all open MRs from configured groups (cached, shared by team + discussions).
@@ -1482,34 +1348,9 @@ class GitLabSync:
                     break
                 page = data["group"]["mergeRequests"]
                 for node in page["nodes"]:
-                    # Normalize to REST-like structure
-                    all_mrs.append({
-                        "iid": int(node["iid"]),
-                        "title": node["title"],
-                        "web_url": node["webUrl"],
-                        "draft": node.get("draft", False),
-                        "work_in_progress": node.get("draft", False),
-                        "approved": node.get("approved", False),
-                        "approved_by": [a["username"] for a in (node.get("approvedBy") or {}).get("nodes", [])],
-                        "reviewers": [r["username"] for r in (node.get("reviewers") or {}).get("nodes", [])],
-                        "user_notes_count": node.get("userNotesCount", 0),
-                        "author": {
-                            "username": node.get("author", {}).get("username", "?"),
-                            "id": _gid_to_int(node.get("author", {}).get("id", 0)),
-                        },
-                        "project_id": _gid_to_int(node.get("projectId", 0)),
-                        "created_at": node.get("createdAt", ""),
-                        "updated_at": node.get("updatedAt", ""),
-                        "milestone": (
-                            {"title": node["milestone"]["title"], "due_date": node["milestone"].get("dueDate")}
-                            if node.get("milestone") else None
-                        ),
-                        "head_pipeline": (
-                            {"status": _PIPELINE_STATUS_MAP.get(node["headPipeline"]["status"], node["headPipeline"]["status"].lower())}
-                            if node.get("headPipeline") else None
-                        ),
-                        "references": {"full": self._group_mr_ref_full(node["webUrl"], node.get("reference", ""))},
-                    })
+                    mr = _normalize_mr(node)
+                    mr["reviewers"] = [r["username"] for r in (node.get("reviewers") or {}).get("nodes", [])]
+                    all_mrs.append(mr)
                 info = page.get("pageInfo") or {}
                 if not info.get("hasNextPage"):
                     break
@@ -1523,12 +1364,6 @@ class GitLabSync:
         self._all_group_mrs = other_mrs
         self.cache.set("all_group_mrs", other_mrs)
         return other_mrs
-
-    @staticmethod
-    def _group_mr_ref_full(web_url, reference):
-        project_path = web_url.split("/-/")[0].rstrip("/")
-        repo_name = project_path.rsplit("/", 1)[-1] if project_path else "unknown"
-        return f"{repo_name}{reference}" if reference else ""
 
     def fetch_team_mrs(self):
         """Fetch team MRs for the review list (--team only). Includes drafts."""
@@ -1551,49 +1386,26 @@ class GitLabSync:
 
         print(f"Fetching discussions for {len(participated)} team MRs I commented on...", file=sys.stderr)
         for mr in participated:
-            project_id = mr["project_id"]
-            iid = mr["iid"]
-            output = self.run_command(
-                ["glab", "api", f"projects/{project_id}/merge_requests/{iid}/discussions?per_page=100"]
-            )
-            if not output:
-                continue
-
-            discussions = json.loads(output)
-            if not isinstance(discussions, list):
-                continue
-
-            to_close = 0
-            for disc in discussions:
-                notes = disc.get("notes", [])
-                if not notes:
-                    continue
-                if notes[0].get("system", False):
-                    continue
-                if not notes[0].get("resolvable", False):
-                    continue
-                if all(n.get("resolved", False) for n in notes if n.get("resolvable")):
-                    continue
-
-                authored = [n for n in notes if (n.get("author") or {}).get("username")]
-                if not authored:
-                    continue
-
-                first_author = (authored[0].get("author") or {}).get("username", "")
-                last_author = (authored[-1].get("author") or {}).get("username", "")
-
-                # Only care about threads I opened where someone replied
-                if first_author == self.username and last_author != self.username:
-                    to_close += 1
-
-            if to_close > 0:
+            counts = self._threads_for(mr, open_kinds=("to_close",))
+            if counts["to_close"]:
+                # On someone else's MR only the threads I opened matter
                 self.mr_discussions[mr["web_url"]] = {
-                    "pending": 0,
-                    "answered": 0,
-                    "to_close": to_close,
-                    "resolved": 0,
-                    "pending_authors": set(),
+                    "pending": 0, "answered": 0, "to_close": counts["to_close"],
+                    "resolved": 0, "comments": 0, "pending_authors": set(),
+                    "open_threads": [t for t in counts["open_threads"] if t["kind"] == "to_close"],
                 }
+        self._save_store(keep={mr["web_url"] for mr in self.mrs} | {mr["web_url"] for mr in all_group})
+
+        # GitLab's own reviewer state: "unreviewed" comes back when the author asks again
+        for mr in all_group:
+            if self.username not in mr.get("reviewers", []) or self.username in mr.get("approved_by", []):
+                continue
+            output = self.run_command(
+                ["glab", "api", f"projects/{mr['project_id']}/merge_requests/{mr['iid']}/reviewers"]
+            )
+            for r in json.loads(output) if output else []:
+                if (r.get("user") or {}).get("username") == self.username:
+                    self.review_state[mr["web_url"]] = r.get("state", "")
 
         team_discussed = sum(
             1 for mr in all_group
@@ -1665,13 +1477,20 @@ class GitLabSync:
 
     # -- MR categorization (shared by both formatters) --
 
+    @staticmethod
+    def _milestone_first(mr):
+        ms = mr.get("milestone")
+        return (0, ms.get("due_date") or "9999") if ms else (1, "")
+
     def categorize_mrs(self, todos):
         STALE_DAYS = self.config.get("stale_days", 7)
+        BACKLOG_DAYS = self.config.get("backlog_days", 14)
         act_now = []
+        failed = []
         approved = []
-        ping_reviewer = []
         in_progress = []
         waiting = []
+        backlog = []
         on_hold_mrs = []
         act_now_urls = set()
 
@@ -1692,32 +1511,27 @@ class GitLabSync:
                 act_now.append(mr)
                 act_now_urls.add(mr["web_url"])
 
-        build_failure_mr_urls = set()
-        for todo in todos.get("build_failed", []):
-            target = todo.get("target", {})
-            if target.get("web_url"):
-                build_failure_mr_urls.add(target["web_url"])
-
-        for mr in conflict_mrs:
-            if mr["web_url"] not in act_now_urls and mr["web_url"] in active_mr_urls:
-                act_now.append(mr)
+        # A failed build counts only on an MR that still moves
+        for mr in self.mrs:
+            if mr["web_url"] in act_now_urls or mr["web_url"] not in active_mr_urls:
+                continue
+            status = (mr.get("head_pipeline") or {}).get("status")
+            if status == "failed" and self._get_staleness(mr) < STALE_DAYS:
+                failed.append(mr)
                 act_now_urls.add(mr["web_url"])
 
-        excluded_urls = act_now_urls | build_failure_mr_urls
-
         for mr in self.mrs:
-            if mr["web_url"] in excluded_urls or mr["web_url"] not in active_mr_urls:
+            if mr["web_url"] in act_now_urls or mr["web_url"] not in active_mr_urls:
                 continue
             category = self.get_mr_category(mr)
-            days_idle = self._get_staleness(mr)
-            has_approval = bool(self.mr_approvals.get(mr["web_url"], {}).get("approved_by"))
+            has_approval = not mr.get("draft") and bool(mr.get("approved_by"))
 
             if category == "ready_to_merge" or has_approval:
                 approved.append(mr)
+            elif not mr.get("milestone") and self._get_staleness(mr) >= BACKLOG_DAYS:
+                backlog.append(mr)
             elif category == "draft":
                 in_progress.append(mr)
-            elif category in ("needs_approval", "needs_review") and days_idle >= STALE_DAYS:
-                ping_reviewer.append(mr)
             else:
                 waiting.append(mr)
 
@@ -1731,13 +1545,14 @@ class GitLabSync:
             if self.mr_discussions.get(mr["web_url"], {}).get("to_close", 0) > 0:
                 close_mrs.append(mr)
 
-        # Review Requested: team MRs where I am a reviewer and have not approved
+        # Reviews: team MRs where GitLab says my review is still owed (first ask or a re-request)
         review_requested = [
             mr for mr in getattr(self, "_all_group_mrs", [])
             if self.username in mr.get("reviewers", [])
             and self.username not in mr.get("approved_by", [])
+            and self.review_state.get(mr["web_url"], "unreviewed") in ("unreviewed", "review_started")
         ]
-        review_requested.sort(key=lambda m: m.get("created_at", ""))
+        review_requested.sort(key=lambda m: (self._milestone_first(m), m.get("created_at", "")))
 
         # To Do: issues with no open MR (work not started yet)
         filtered_issues = self.filter_relevant_issues()
@@ -1755,12 +1570,11 @@ class GitLabSync:
         ]
 
         # Smart sorting
-        approved.sort(
-            key=lambda m: len(self.mr_approvals.get(m["web_url"], {}).get("approved_by", [])),
-            reverse=True,
-        )
-        ping_reviewer.sort(key=lambda m: self._get_staleness(m), reverse=True)
-        waiting.sort(key=lambda m: self._get_staleness(m), reverse=True)
+        act_now.sort(key=self._milestone_first)
+        approved.sort(key=lambda m: (self._milestone_first(m), -len(m.get("approved_by", []))))
+        in_progress.sort(key=lambda m: (self._milestone_first(m), self._get_staleness(m)))
+        waiting.sort(key=lambda m: (self._milestone_first(m), self._get_staleness(m)))
+        backlog.sort(key=lambda m: self._get_staleness(m))
 
         # Stats
         pending_threads = sum(1 for v in self.mr_discussions.values() if v["pending"] > 0)
@@ -1775,21 +1589,20 @@ class GitLabSync:
 
         return {
             "act_now": act_now,
-            "act_now_urls": act_now_urls,
+            "failed": failed,
+            "backlog": backlog,
             "approved": approved,
             "close_mrs": close_mrs,
             "review_requested": review_requested,
-            "ping_reviewer": ping_reviewer,
             "in_progress": in_progress,
             "waiting": waiting,
             "todo_issues": todo_issues,
             "issues_with_mrs": issues_with_mrs,
             "on_hold_mrs": on_hold_mrs,
-            "conflict_mrs": conflict_mrs,
             "stats": {
                 "pending_threads": pending_threads,
                 "to_close_threads": to_close_threads,
-                "build_failures": len(todos.get("build_failed", [])),
+                "build_failures": len(failed),
                 "conflicts": len(conflict_mrs),
                 "ready_count": ready_count,
                 "stale_count": stale_count,
@@ -1961,7 +1774,7 @@ class GitLabSync:
         print(f"Done: {link}", file=sys.stderr)
 
         if keep:
-            snapshot_path = self.get_snapshot_path(date)
+            snapshot_path = self.get_daily_note_path(date, "-snapshot")
             if not snapshot_path.exists():
                 with open(snapshot_path, "w") as f:
                     f.write(final_content)

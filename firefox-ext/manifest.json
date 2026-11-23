@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "GitLab tasks",
+  "version": "0.2",
+  "description": "Sorts your open MRs and issues into to do and done, on top of the gitlab.com dashboard pages.",
+  "permissions": ["https://gitlab.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://gitlab.com/dashboard/*"],
+      "js": ["logic.js", "content.js"],
+      "css": ["content.css"]
+    }
+  ],
+  "browser_specific_settings": { "gecko": { "id": "gitlab-tasks@tham-le" } }
+}
