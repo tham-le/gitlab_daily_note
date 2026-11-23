@@ -143,5 +143,12 @@ class Notes(unittest.TestCase):
         self.assertEqual(_sync().merge_with_existing("x\n## Notes\n- ", notes), f"x\n## Notes\n{notes}")
 
 
+class IssueRefs(unittest.TestCase):
+    def test_refs_resolve_to_the_right_project(self):
+        text = "Fixes other-repo#12, see g/sub/p2#3 and #7. Color #ff0000, mr/5#note_1"
+        paths = [gd._issue_ref_path("g/sub/p", m.group(1)) + "#" + m.group(2) for m in gd._ISSUE_REF_RE.finditer(text)]
+        self.assertEqual(paths, ["g/sub/other-repo#12", "g/sub/p2#3", "g/sub/p#7"])
+
+
 if __name__ == "__main__":
     unittest.main()

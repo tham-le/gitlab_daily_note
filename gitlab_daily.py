@@ -202,11 +202,19 @@ ISSUES_QUERY_TEMPLATE = """
 """
 
 
-# Matches cross-project issue refs like `namespace/project#42` or same-project `#42`.
-# Group 1: optional project path (must contain at least one slash to be cross-project).
-# Group 2: issue number.
-_ISSUE_REF_RE = re.compile(r'(?:((?:[\w.-]+/)+[\w.-]+))?#(\d+)')
+# Matches issue refs: `group/project#42`, `project#42` (same namespace) or `#42` (same project).
+# Group 1: optional project path. Group 2: issue number.
+_ISSUE_REF_RE = re.compile(r'(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+)?#(\d+)\b')
 _ISSUE_URL_RE = re.compile(r'(.*)/-/(?:issues|work_items)/(\d+)')
+
+
+def _issue_ref_path(own_path, proj_part):
+    """Full project path of an issue ref found in an MR of project `own_path`."""
+    if not proj_part:
+        return own_path
+    if "/" in proj_part:
+        return proj_part
+    return f"{own_path.rsplit('/', 1)[0]}/{proj_part}"
 
 
 def _issue_url_key(url):
@@ -1196,7 +1204,7 @@ class GitLabSync:
             for m in _ISSUE_REF_RE.finditer(description):
                 proj_part = m.group(1)
                 issue_num = m.group(2)
-                ref_path = proj_part if proj_part else own_path
+                ref_path = _issue_ref_path(own_path, proj_part)
                 issue_url = f"{gitlab_base}{ref_path}/-/issues/{issue_num}"
                 if _issue_url_key(issue_url) in known_keys:
                     continue
