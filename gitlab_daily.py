@@ -497,8 +497,8 @@ class PlainFormatter:
             lines.append(f"- {len(sync.team_mrs)} team MRs to review")
         lines.append("")
 
-    def format_markdown(self, sync, date, todos, diff=None):
-        cats = sync.categorize_mrs(todos)
+    def format_markdown(self, sync, date, diff=None):
+        cats = sync.categorize_mrs()
         lines = []
         self._render_header(sync, lines, date, cats["stats"])
 
@@ -1488,7 +1488,7 @@ class GitLabSync:
         ms = mr.get("milestone")
         return (0, ms.get("due_date") or "9999") if ms else (1, "")
 
-    def categorize_mrs(self, todos):
+    def categorize_mrs(self):
         STALE_DAYS = self.config.get("stale_days", 7)
         BACKLOG_DAYS = self.config.get("backlog_days", 14)
         act_now = []
@@ -1621,53 +1621,21 @@ class GitLabSync:
 
     # -- Todo categorization --
 
-    def categorize_todos(self):
-        categories = {
-            "review_submitted": [], "build_failed": [], "unmergeable": [],
-            "assigned": [], "needs_action": [],
-        }
-        recent_cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+    def cleanup_todos(self):
+        """Mark todos as done when their MR or issue is closed or merged, or their failed build passed."""
         stale_todos = []
-
         for todo in self.todos:
-            created = datetime.fromisoformat(todo["created_at"].replace("Z", "+00:00"))
-            target = todo.get("target", {})
-            if target and target.get("state", "") in ["closed", "merged"]:
+            target = todo.get("target") or {}
+            pipeline = target.get("head_pipeline") or {}
+            if target.get("state") in ("closed", "merged"):
                 stale_todos.append(todo)
-                continue
-            if todo["action_name"] == "build_failed":
-                head_pipeline = (target or {}).get("head_pipeline") or {}
-                pipeline_status = head_pipeline.get("status", "")
-                if pipeline_status == "success":
-                    stale_todos.append(todo)
-                    continue
-                if self._is_on_hold(target or {}):
-                    continue
-                categories["build_failed"].append(todo)
-                continue
-            if todo["action_name"] == "unmergeable":
-                categories["unmergeable"].append(todo)
-                continue
-            if created < recent_cutoff:
-                continue
-            action = todo["action_name"]
-            if action in categories:
-                categories[action].append(todo)
-            else:
-                categories["needs_action"].append(todo)
-
-        if self.auto_cleanup and stale_todos:
-            print(f"\nCleaning up {len(stale_todos)} stale todos...", file=sys.stderr)
-            for todo in stale_todos:
-                self.dismiss_todo(todo["id"])
-
-        if stale_todos:
-            print(f"\nFound {len(stale_todos)} stale todos (merged/closed)", file=sys.stderr)
-        for cat, items in categories.items():
-            if items:
-                print(f"  {cat}: {len(items)} items", file=sys.stderr)
-
-        return categories
+            elif todo["action_name"] == "build_failed" and pipeline.get("status") == "success":
+                stale_todos.append(todo)
+        if not stale_todos:
+            return
+        print(f"\nCleaning up {len(stale_todos)} stale todos...", file=sys.stderr)
+        for todo in stale_todos:
+            self.dismiss_todo(todo["id"])
 
     # -- JSON state for diff --
 
@@ -1758,14 +1726,14 @@ class GitLabSync:
             print("\nFetching team MRs to review...", file=sys.stderr)
             self.fetch_team_mrs()
 
-        print("\nCategorizing todos...", file=sys.stderr)
-        todo_categories = self.categorize_todos()
+        if self.auto_cleanup:
+            self.cleanup_todos()
 
         print("\nComputing diff...", file=sys.stderr)
         diff = self.compute_diff(date)
 
         print("\nGenerating markdown...", file=sys.stderr)
-        result = self.formatter.format_markdown(self, date, todo_categories, diff)
+        result = self.formatter.format_markdown(self, date, diff)
         print(f"Generated {len(result)} characters", file=sys.stderr)
 
         self._save_state(date)

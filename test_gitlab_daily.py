@@ -116,7 +116,7 @@ class Reviews(unittest.TestCase):
         mk = lambda i: {"iid": i, "title": "t", "web_url": f"https://x/-/merge_requests/{i}", "reviewers": ["me"]}
         sync._all_group_mrs = [mk(1), mk(2), mk(3)]
         sync.review_state = {mk(2)["web_url"]: "reviewed", mk(3)["web_url"]: "unreviewed"}
-        self.assertEqual([m["iid"] for m in sync.categorize_mrs({})["review_requested"]], [1, 3])
+        self.assertEqual([m["iid"] for m in sync.categorize_mrs()["review_requested"]], [1, 3])
 
     def test_review_state_is_read_when_no_group_mr_has_comments(self):
         sync = _sync()
@@ -124,7 +124,7 @@ class Reviews(unittest.TestCase):
         reply = '[{"user": {"username": "me"}, "state": "reviewed"}]'
         with mock.patch.object(sync, "run_command", return_value=reply):
             sync.fetch_team_discussions()
-        self.assertEqual(sync.categorize_mrs({})["review_requested"], [])
+        self.assertEqual(sync.categorize_mrs()["review_requested"], [])
 
 
 class Buckets(unittest.TestCase):
@@ -144,7 +144,7 @@ class Buckets(unittest.TestCase):
             self.mr(4, 40, approved_by=["bob"]),
             self.mr(5, 2, draft=True),
         ]
-        cats = sync.categorize_mrs({})
+        cats = sync.categorize_mrs()
         ids = lambda key: [m["iid"] for m in cats[key]]
         self.assertEqual(ids("failed"), [1])
         self.assertEqual(ids("backlog"), [2])
@@ -163,9 +163,21 @@ class Buckets(unittest.TestCase):
         with mock.patch.object(sync, "_threads_for", return_value=dict(counts, pending=0)), \
              mock.patch.object(sync, "_save_store"), mock.patch.object(sync, "run_command", return_value="[]"):
             sync.fetch_team_discussions()
-        cats = sync.categorize_mrs({})
+        cats = sync.categorize_mrs()
         self.assertEqual([m["iid"] for m in cats["act_now"]], [1])
         self.assertEqual([m["iid"] for m in cats["close_mrs"]], [1])
+
+
+class Todos(unittest.TestCase):
+    def test_only_stale_todos_are_dismissed(self):
+        sync = _sync()
+        todo = lambda i, action, state, status=None: {"id": i, "action_name": action,
+            "target": {"state": state, "head_pipeline": {"status": status} if status else None}}
+        sync.todos = [todo(1, "assigned", "merged"), todo(2, "build_failed", "opened", "success"),
+                      todo(3, "build_failed", "opened", "failed"), todo(4, "mentioned", "opened")]
+        with mock.patch.object(sync, "dismiss_todo") as dismiss:
+            sync.cleanup_todos()
+        self.assertEqual([c.args[0] for c in dismiss.call_args_list], [1, 2])
 
 
 class Notes(unittest.TestCase):
