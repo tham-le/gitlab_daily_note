@@ -1107,7 +1107,6 @@ class GitLabSync:
             counts = self._threads_for(mr)
             if any(counts[k] for k in self._THREAD_COUNTS):
                 self.mr_discussions[mr["web_url"]] = counts
-        self._save_store()
         print(f"  {self.store_hits} unchanged MRs read from the store", file=sys.stderr)
 
         discussed = sum(
@@ -1399,7 +1398,6 @@ class GitLabSync:
                     "resolved": 0, "comments": 0, "pending_authors": set(),
                     "open_threads": [t for t in counts["open_threads"] if t["kind"] == "to_close"],
                 }
-        self._save_store(keep={mr["web_url"] for mr in self.mrs} | {mr["web_url"] for mr in all_group})
 
         team_discussed = sum(
             1 for mr in all_group
@@ -1721,6 +1719,8 @@ class GitLabSync:
 
         print("\nChecking threads on group MRs...", file=sys.stderr)
         self.fetch_team_discussions()
+        open_urls = {mr["web_url"] for mr in self.mrs + getattr(self, "_all_group_mrs", [])}
+        self._save_store(keep=open_urls)
 
         if self.include_team:
             print("\nFetching team MRs to review...", file=sys.stderr)
