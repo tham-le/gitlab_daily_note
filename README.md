@@ -31,7 +31,7 @@ python gitlab_daily.py --format obsidian        # Obsidian callouts + frontmatte
 python gitlab_daily.py --keep                   # Save a snapshot on first run of the day
 python gitlab_daily.py --team                   # Include team MRs to review
 python gitlab_daily.py --stdout                 # Print to stdout instead of saving
-python gitlab_daily.py --no-cleanup             # Don't auto-dismiss stale todos
+python gitlab_daily.py --cleanup                # Mark stale todos as done on GitLab
 python gitlab_daily.py --config path            # Use a custom config file
 ```
 

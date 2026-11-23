@@ -786,7 +786,7 @@ FORMATTERS = {"plain": PlainFormatter, "obsidian": ObsidianFormatter}
 # ---------------------------------------------------------------------------
 
 class GitLabSync:
-    def __init__(self, config=None, auto_cleanup=True, format="plain"):
+    def __init__(self, config=None, auto_cleanup=False, format="plain"):
         self.config = config or DEFAULT_CONFIG
         self.todos = []
         self.mrs = []
@@ -1813,7 +1813,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", default=None, help=f"Path to config file (default: {CONFIG_FILENAME})")
     parser.add_argument("--format", choices=["plain", "obsidian"], default="plain", help="Output format (default: plain)")
     parser.add_argument("--team", action="store_true", help="Include team MRs for review")
-    parser.add_argument("--no-cleanup", action="store_true", help="Don't auto-dismiss stale todos")
+    parser.add_argument("--cleanup", action="store_true", help="Mark todos on merged or closed MRs and issues, and on fixed builds, as done")
     parser.add_argument("--stdout", action="store_true", help="Print to stdout instead of saving")
     parser.add_argument("--keep", action="store_true", help="Save a snapshot of the first run of the day")
     args = parser.parse_args()
@@ -1823,7 +1823,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     config = load_config(args.config)
-    sync = GitLabSync(config=config, auto_cleanup=not args.no_cleanup, format=args.format)
+    sync = GitLabSync(config=config, auto_cleanup=args.cleanup, format=args.format)
     sync.include_team = args.team
 
     if args.stdout:
