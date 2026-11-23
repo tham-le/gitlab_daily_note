@@ -137,5 +137,11 @@ class Buckets(unittest.TestCase):
         self.assertEqual(ids("in_progress"), [5])
 
 
+class Notes(unittest.TestCase):
+    def test_backslashes_in_notes_are_kept(self):
+        notes = r"path C:\temp\x, regex \d+"
+        self.assertEqual(_sync().merge_with_existing("x\n## Notes\n- ", notes), f"x\n## Notes\n{notes}")
+
+
 if __name__ == "__main__":
     unittest.main()

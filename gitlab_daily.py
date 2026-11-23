@@ -827,7 +827,7 @@ class GitLabSync:
         notes_pattern = r"^## Notes\s*\n- \s*$"
         if re.search(notes_pattern, new_content, re.MULTILINE):
             new_content = re.sub(
-                notes_pattern, f"## Notes\n{existing_notes}",
+                notes_pattern, lambda _: f"## Notes\n{existing_notes}",
                 new_content, flags=re.MULTILINE,
             )
         return new_content
