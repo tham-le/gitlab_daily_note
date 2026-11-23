@@ -175,7 +175,10 @@
           return "h";
         }
         const i = rowSection(row);
-        if (i < 0) return "";
+        if (i < 0) {
+          row.style.order = SECTIONS.length + 1;
+          return "";
+        }
         row.style.order = i;
         counts.set(i, (counts.get(i) || 0) + 1);
         return i;
