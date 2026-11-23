@@ -7,6 +7,7 @@ from unittest import mock
 
 import gitlab_common
 import gitlab_daily as gd
+import gitlab_monthly_resume as monthly
 
 
 def _sync():
@@ -187,6 +188,20 @@ class Paging(unittest.TestCase):
                  ', after: "c"': {"x": {"nodes": [3], "pageInfo": {"hasNextPage": False}}}}
         with mock.patch.object(gitlab_common, "run_graphql", lambda q: pages[q]):
             self.assertEqual(gitlab_common.run_graphql_all(lambda after: after, ["x"]), [1, 2, 3])
+
+
+class Monthly(unittest.TestCase):
+    def test_sections_use_the_state_at_month_end(self):
+        since, until = "2026-03-01T00:00:00Z", "2026-04-01T00:00:00Z"
+        mr = lambda i, created, merged=None, closed=None: {"iid": i, "created_at": created, "merged_at": merged, "closed_at": closed}
+        mrs = [
+            mr(1, "2026-03-10T00:00:00Z", merged="2026-03-20T00:00:00Z"),
+            mr(2, "2026-03-10T00:00:00Z", merged="2026-04-05T00:00:00Z"),
+            mr(3, "2026-03-10T00:00:00Z", closed="2026-03-12T00:00:00Z"),
+            mr(4, "2026-02-10T00:00:00Z", closed="2026-04-02T00:00:00Z"),
+        ]
+        merged, opened, carried = monthly.categorize_mrs(mrs, since, until)
+        self.assertEqual(([m["iid"] for m in merged], [m["iid"] for m in opened], [m["iid"] for m in carried]), ([1], [2], [4]))
 
 
 class Notes(unittest.TestCase):

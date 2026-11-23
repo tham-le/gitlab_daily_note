@@ -32,13 +32,12 @@ MRS_QUERY_TEMPLATE = """
         {source}(
             {state_filter}
             updatedAfter: "{since}"
-            updatedBefore: "{until}"
             first: 100{after}
         ) {{
             pageInfo {{ hasNextPage endCursor }}
             nodes {{
                 iid title webUrl state
-                createdAt mergedAt updatedAt
+                createdAt mergedAt closedAt updatedAt
                 reference projectId
             }}
         }}
@@ -51,7 +50,6 @@ ISSUES_QUERY_TEMPLATE = """
     issues(
         assigneeUsernames: ["{username}"]
         updatedAfter: "{since}"
-        updatedBefore: "{until}"
         first: 100{after}
     ) {{
         pageInfo {{ hasNextPage endCursor }}
@@ -103,6 +101,7 @@ def _normalize_mr(node):
         "state": node.get("state", "").lower(),
         "created_at": node.get("createdAt", ""),
         "merged_at": node.get("mergedAt", ""),
+        "closed_at": node.get("closedAt", ""),
         "updated_at": node.get("updatedAt", ""),
         "project_id": gid_to_int(node.get("projectId", 0)),
         "references": {"full": f"{repo_name}{ref}"},
@@ -125,38 +124,32 @@ def _normalize_issue(node):
 # Categorization
 # ---------------------------------------------------------------------------
 
+def _open_at(item, until):
+    """True when the MR or issue was still open at `until`."""
+    ended = [t for t in (item.get("merged_at"), item.get("closed_at")) if t]
+    return not ended or min(ended) >= until
+
+
+def _categorize(items, done_key, since, until):
+    done, opened, carried = [], [], []
+    for item in items:
+        done_at = item.get(done_key) or ""
+        created_at = item.get("created_at", "")
+        if since <= done_at < until:
+            done.append(item)
+        elif _open_at(item, until) and since <= created_at < until:
+            opened.append(item)
+        elif _open_at(item, until) and created_at < since:
+            carried.append(item)
+    return done, opened, carried
+
+
 def categorize_mrs(mrs, since, until):
-    merged, opened, carried = [], [], []
-    for mr in mrs:
-        merged_at = mr.get("merged_at") or ""
-        created_at = mr.get("created_at", "")
-        state = mr.get("state", "")
-
-        if state == "merged" and merged_at and since <= merged_at < until:
-            merged.append(mr)
-        elif since <= created_at < until and state != "merged":
-            opened.append(mr)
-        elif state == "opened":
-            carried.append(mr)
-
-    return merged, opened, carried
+    return _categorize(mrs, "merged_at", since, until)
 
 
 def categorize_issues(issues, since, until):
-    closed, opened, carried = [], [], []
-    for issue in issues:
-        closed_at = issue.get("closed_at") or ""
-        created_at = issue.get("created_at", "")
-        state = issue.get("state", "")
-
-        if state == "closed" and closed_at and since <= closed_at < until:
-            closed.append(issue)
-        elif since <= created_at < until and state != "closed":
-            opened.append(issue)
-        elif state == "opened":
-            carried.append(issue)
-
-    return closed, opened, carried
+    return _categorize(issues, "closed_at", since, until)
 
 
 # ---------------------------------------------------------------------------
