@@ -150,5 +150,23 @@ class IssueRefs(unittest.TestCase):
         self.assertEqual(paths, ["g/sub/other-repo#12", "g/sub/p2#3", "g/sub/p#7"])
 
 
+class Diff(unittest.TestCase):
+    def test_second_run_of_the_day_still_compares_to_yesterday(self):
+        import tempfile
+        from datetime import datetime
+        sync = _sync()
+        sync.base_dir = gd.Path(tempfile.mkdtemp())
+        mr = lambda iid: {"iid": iid, "title": "t", "web_url": f"u/{iid}", "created_at": ""}
+        sync.mrs = [mr(1)]
+        sync._save_state(datetime(2026, 1, 1, 9))
+        sync.mrs = [mr(1), mr(2)]
+        for hour in (9, 17):
+            today = datetime(2026, 1, 2, hour)
+            diff = sync.compute_diff(today)
+            self.assertEqual(diff["days_back"], 1)
+            self.assertEqual(diff["gone_mr_urls"], set())
+            sync._save_state(today)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1683,11 +1683,20 @@ class GitLabSync:
         except (json.JSONDecodeError, OSError):
             return None
 
+    def _baseline(self, date):
+        """State of the last run before `date`: the one today's diff compares to."""
+        state = self._load_state()
+        if state and state.get("date") == date.strftime("%Y-%m-%d"):
+            return state.get("prev")
+        return state
+
     def _save_state(self, date):
+        prev = self._baseline(date)
         state = {
             "date": date.strftime("%Y-%m-%d"),
             "mr_urls": [mr["web_url"] for mr in self.mrs],
             "issue_urls": [i["web_url"] for i in self.issues],
+            "prev": prev and {k: prev[k] for k in ("date", "mr_urls", "issue_urls") if k in prev},
         }
         path = self._state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1695,7 +1704,7 @@ class GitLabSync:
             json.dump(state, f, indent=2)
 
     def compute_diff(self, date):
-        prev_state = self._load_state()
+        prev_state = self._baseline(date)
         if not prev_state or not prev_state.get("date"):
             return None
 
